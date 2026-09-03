@@ -106,6 +106,7 @@ struct DecodedFrame {
     frame: Frame,
     thumb: Handle,
     preview: Handle,
+    png: Vec<u8>,
 }
 
 struct Extracted {
@@ -313,7 +314,6 @@ impl State {
         let Some(dir) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
-        let matrix = self.matrix.to_matrix();
         if let Err(err) = std::fs::create_dir_all(&dir) {
             self.error = Some(err.to_string());
             return;
@@ -330,22 +330,9 @@ impl State {
                 }
             );
             let path = dir.join(format!("{stem}.png"));
-            let rgb = decoded.frame.to_rgb(matrix);
-            match image::RgbImage::from_raw(
-                decoded.frame.width as u32,
-                decoded.frame.height as u32,
-                rgb,
-            ) {
-                Some(img) => {
-                    if let Err(err) = img.save(&path) {
-                        self.error = Some(format!("writing {}: {err}", path.display()));
-                        return;
-                    }
-                }
-                None => {
-                    self.error = Some(String::from("frame dimensions did not match buffer"));
-                    return;
-                }
+            if let Err(err) = std::fs::write(&path, &decoded.png) {
+                self.error = Some(format!("writing {}: {err}", path.display()));
+                return;
             }
         }
         self.status = format!("{} frames saved to {}", result.frames.len(), dir.display());
@@ -484,6 +471,8 @@ impl State {
             .map(|f| Thumb {
                 index: f.record.index,
                 offset: f.record.offset,
+                source_size: f.record.source_size,
+                png_size: f.png.len() as u64,
                 partial: f.record.partial,
                 handle: f.thumb.clone(),
             })
@@ -492,11 +481,13 @@ impl State {
         let preview = self.selected.and_then(|i| {
             result.frames.iter().find(|f| f.record.index == i).map(|f| {
                 let caption = format!(
-                    "frame {:05}  offset {}  {}×{}{}",
+                    "frame {:05}  offset {}  {}×{}  src {} → png {}{}",
                     f.record.index,
                     f.record.offset,
                     f.frame.width,
                     f.frame.height,
+                    iframe_extract::report::human_bytes(f.record.source_size),
+                    iframe_extract::report::human_bytes(f.png.len() as u64),
                     if f.record.partial { "  partial" } else { "" }
                 );
                 (f.preview.clone(), caption)
@@ -632,11 +623,13 @@ fn run_extract(
         let rgb = frame.to_rgb(matrix);
         let thumb = handle_from_rgb(&rgb, frame.width, frame.height, 200);
         let preview = handle_from_rgb(&rgb, frame.width, frame.height, 960);
+        let png = encode_png(rgb, frame.width, frame.height)?;
         frames.push(DecodedFrame {
             record,
             frame,
             thumb,
             preview,
+            png,
         });
         reporter.progress((i + 1) as u64, n as u64, &format!("{}/{n}", i + 1));
     }
@@ -644,9 +637,10 @@ fn run_extract(
     let r = &extraction.report;
     let summary = match r.truncation_offset {
         Some(off) => format!(
-            "{} NALs · {} frames · chain broke at {off}",
+            "{} NALs · {} frames · chain broke at {off} ({:.2}% of file)",
             r.nal_count,
-            frames.len()
+            frames.len(),
+            off as f64 / data.len().max(1) as f64 * 100.0
         ),
         None => format!(
             "{} NALs · {} frames · chain ran to end of mdat",
@@ -682,6 +676,15 @@ fn read_input(path: &Path, reporter: &mut dyn Reporter) -> anyhow::Result<Vec<u8
     }
     reporter.finish_phase(&iframe_extract::report::human_bytes(data.len() as u64));
     Ok(data)
+}
+
+fn encode_png(rgb: Vec<u8>, w: usize, h: usize) -> Result<Vec<u8>, String> {
+    let img = image::RgbImage::from_raw(w as u32, h as u32, rgb)
+        .ok_or("frame dimensions did not match buffer")?;
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 fn handle_from_rgb(rgb: &[u8], w: usize, h: usize, max_side: u32) -> Handle {

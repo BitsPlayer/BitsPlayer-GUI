@@ -26,66 +26,113 @@ impl FileMap {
         }
     }
 
-    fn span_at_byte(&self, offset: u64) -> Option<&LayoutSpan> {
+    fn span_index_at(&self, offset: u64) -> Option<usize> {
         let i = self
             .spans
             .partition_point(|s| s.offset.saturating_add(s.size) <= offset);
-        self.spans.get(i).filter(|s| s.contains(offset))
+        self.spans.get(i).filter(|s| s.contains(offset)).map(|_| i)
+    }
+
+    fn status_for(&self, i: usize) -> String {
+        let span = &self.spans[i];
+        format!(
+            "{} · off {} (0x{:08X})",
+            span.status_line(),
+            span.offset,
+            span.offset
+        )
+    }
+
+    /// Span under the cursor, as an index into `spans`.
+    fn span_at_cursor(&self, bounds: Rectangle, cursor: mouse::Cursor) -> Option<usize> {
+        let pos = cursor.position_in(bounds)?;
+        let ribbon = ribbon_for(bounds.size());
+        let at = ribbon.position_at(pos.x, pos.y)?;
+        let byte = (at / ribbon.total * self.file_size as f64).floor() as u64;
+        self.span_index_at(byte.min(self.file_size.saturating_sub(1)))
     }
 }
 
 #[derive(Debug, Default)]
 pub struct MapState {
     hover: Option<String>,
-    selected_cell: Option<usize>,
+    selected: Option<usize>,
 }
 
+const ROW_H: f32 = 12.0;
+const ROW_GAP: f32 = 2.0;
+/// Sub-pixel spans are widened to this so no frame disappears entirely.
+const MIN_W: f64 = 0.75;
+/// Rectangles at least this wide get a divider so frame edges stay readable.
+const DIVIDER_MIN_W: f32 = 4.0;
+
+/// The file laid out as one continuous byte ribbon, wrapped into rows.
 #[derive(Clone, Copy)]
-struct Grid {
-    cols: usize,
+struct Ribbon {
     rows: usize,
-    cell: f32,
-    gap: f32,
-    cells: usize,
+    row_w: f64,
+    total: f64,
 }
 
-fn grid_for(bounds: Size) -> Grid {
-    const GAP: f32 = 1.0;
-    const CELL: f32 = 10.0;
-    let cols = ((bounds.width + GAP) / (CELL + GAP)).floor().max(1.0) as usize;
-    let rows = ((bounds.height + GAP) / (CELL + GAP)).floor().max(1.0) as usize;
-    let cells = cols.saturating_mul(rows).max(1);
-    Grid {
-        cols,
+fn ribbon_for(bounds: Size) -> Ribbon {
+    let stride = ROW_H + ROW_GAP;
+    let rows = ((bounds.height + ROW_GAP) / stride).floor().max(1.0) as usize;
+    let row_w = bounds.width.max(1.0) as f64;
+    Ribbon {
         rows,
-        cell: CELL,
-        gap: GAP,
-        cells,
+        row_w,
+        total: rows as f64 * row_w,
     }
 }
 
-fn cell_index(grid: Grid, bounds: Rectangle, cursor: Point) -> Option<usize> {
-    if cursor.x < bounds.x || cursor.y < bounds.y {
-        return None;
+impl Ribbon {
+    fn position_at(&self, x: f32, y: f32) -> Option<f64> {
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let row = (y / (ROW_H + ROW_GAP)).floor() as usize;
+        if row >= self.rows {
+            return None;
+        }
+        let x = (x as f64).min(self.row_w);
+        Some(row as f64 * self.row_w + x)
     }
-    let lx = cursor.x - bounds.x;
-    let ly = cursor.y - bounds.y;
-    let stride = grid.cell + grid.gap;
-    let col = (lx / stride).floor() as isize;
-    let row = (ly / stride).floor() as isize;
-    if col < 0 || row < 0 {
-        return None;
+
+    fn byte_range(&self, span: &LayoutSpan, file_size: u64) -> (f64, f64) {
+        let scale = self.total / file_size as f64;
+        let x0 = span.offset as f64 * scale;
+        let x1 = span.offset.saturating_add(span.size) as f64 * scale;
+        (x0.min(self.total), x1.max(x0 + MIN_W).min(self.total))
     }
-    let (col, row) = (col as usize, row as usize);
-    if col >= grid.cols || row >= grid.rows {
-        return None;
+}
+
+/// Draws `x0..x1` of the ribbon, splitting it across rows where it wraps.
+fn draw_run(frame: &mut canvas::Frame, ribbon: Ribbon, x0: f64, x1: f64, color: Color) {
+    let mut start = x0;
+    while start < x1 {
+        let row = (start / ribbon.row_w).floor();
+        if row as usize >= ribbon.rows {
+            break;
+        }
+        let end = x1.min((row + 1.0) * ribbon.row_w);
+        let x = (start - row * ribbon.row_w) as f32;
+        let y = row as f32 * (ROW_H + ROW_GAP);
+        let w = (end - start) as f32;
+        frame.fill_rectangle(Point::new(x, y), Size::new(w, ROW_H), color);
+        if end >= x1 && w >= DIVIDER_MIN_W {
+            frame.fill_rectangle(Point::new(x + w - 1.0, y), Size::new(1.0, ROW_H), theme::BG);
+        }
+        start = end;
     }
-    let local_x = lx - col as f32 * stride;
-    let local_y = ly - row as f32 * stride;
-    if local_x > grid.cell || local_y > grid.cell {
-        return None;
+}
+
+fn highlight(color: Color) -> Color {
+    Color {
+        r: (color.r + 0.18).min(1.0),
+        g: (color.g + 0.18).min(1.0),
+        b: (color.b + 0.18).min(1.0),
+        a: 1.0,
     }
-    Some(row * grid.cols + col)
 }
 
 impl canvas::Program<MapMessage> for FileMap {
@@ -98,7 +145,7 @@ impl canvas::Program<MapMessage> for FileMap {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> (canvas::event::Status, Option<MapMessage>) {
-        let Some(pos) = cursor.position_in(bounds) else {
+        if cursor.position_in(bounds).is_none() {
             if state.hover.take().is_some() {
                 return (
                     canvas::event::Status::Captured,
@@ -106,22 +153,10 @@ impl canvas::Program<MapMessage> for FileMap {
                 );
             }
             return (canvas::event::Status::Ignored, None);
-        };
-        // position_in returns coordinates relative to bounds
-        let rel = Rectangle {
-            x: 0.0,
-            y: 0.0,
-            width: bounds.width,
-            height: bounds.height,
-        };
-        let grid = grid_for(bounds.size());
-        let cell = cell_index(grid, rel, Point::new(pos.x, pos.y));
-        let status = cell.and_then(|i| {
-            let quantum = (self.file_size as f64 / grid.cells as f64).max(1.0);
-            let offset = (i as f64 * quantum).floor() as u64;
-            self.span_at_byte(offset.min(self.file_size.saturating_sub(1)))
-                .map(|s| s.status_line())
-        });
+        }
+
+        let span = self.span_at_cursor(bounds, cursor);
+        let status = span.map(|i| self.status_for(i));
 
         match event {
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
@@ -135,7 +170,7 @@ impl canvas::Program<MapMessage> for FileMap {
                 (canvas::event::Status::Captured, None)
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                state.selected_cell = cell;
+                state.selected = span;
                 (
                     canvas::event::Status::Captured,
                     Some(MapMessage::Hover(status)),
@@ -156,41 +191,46 @@ impl canvas::Program<MapMessage> for FileMap {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         frame.fill_rectangle(Point::ORIGIN, bounds.size(), theme::BG);
 
-        let grid = grid_for(bounds.size());
-        let quantum = (self.file_size as f64 / grid.cells as f64).max(1.0);
-        let hover_cell = cursor.position_in(bounds).and_then(|pos| {
-            cell_index(
-                grid,
-                Rectangle {
-                    x: 0.0,
-                    y: 0.0,
-                    width: bounds.width,
-                    height: bounds.height,
-                },
-                Point::new(pos.x, pos.y),
-            )
-        });
+        let ribbon = ribbon_for(bounds.size());
+        for row in 0..ribbon.rows {
+            let y = row as f32 * (ROW_H + ROW_GAP);
+            frame.fill_rectangle(
+                Point::new(0.0, y),
+                Size::new(ribbon.row_w as f32, ROW_H),
+                theme::MAP_UNKNOWN,
+            );
+        }
 
-        for row in 0..grid.rows {
-            for col in 0..grid.cols {
-                let i = row * grid.cols + col;
-                let offset = (i as f64 * quantum).floor() as u64;
-                let kind = self
-                    .span_at_byte(offset.min(self.file_size.saturating_sub(1)))
-                    .map(|s| s.kind);
-                let mut color = kind.map(theme::span_color).unwrap_or(theme::MAP_UNKNOWN);
-                if Some(i) == state.selected_cell || Some(i) == hover_cell {
-                    color = Color {
-                        r: (color.r + 0.18).min(1.0),
-                        g: (color.g + 0.18).min(1.0),
-                        b: (color.b + 0.18).min(1.0),
-                        a: 1.0,
-                    };
+        let hovered = self.span_at_cursor(bounds, cursor);
+
+        // Consecutive sub-pixel spans of the same colour are drawn as one run so
+        // a file with 100k frames does not cost 100k fills per redraw.
+        let mut pending: Option<(f64, f64, Color)> = None;
+        for (i, span) in self.spans.iter().enumerate() {
+            let (x0, x1) = ribbon.byte_range(span, self.file_size);
+            let lit = Some(i) == hovered || Some(i) == state.selected;
+            let color = match lit {
+                true => highlight(theme::span_color(span.kind)),
+                false => theme::span_color(span.kind),
+            };
+
+            if let Some((px0, px1, pc)) = pending {
+                if !lit && pc == color && x0 - px1 < 0.01 && x1 - x0 < 1.0 {
+                    pending = Some((px0, x1.max(px1), pc));
+                    continue;
                 }
-                let x = col as f32 * (grid.cell + grid.gap);
-                let y = row as f32 * (grid.cell + grid.gap);
-                frame.fill_rectangle(Point::new(x, y), Size::new(grid.cell, grid.cell), color);
+                draw_run(&mut frame, ribbon, px0, px1, pc);
             }
+
+            if lit {
+                draw_run(&mut frame, ribbon, x0, x1, color);
+                pending = None;
+            } else {
+                pending = Some((x0, x1, color));
+            }
+        }
+        if let Some((x0, x1, color)) = pending {
+            draw_run(&mut frame, ribbon, x0, x1, color);
         }
 
         vec![frame.into_geometry()]

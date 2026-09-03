@@ -1,6 +1,7 @@
 use iced::widget::image::Handle;
 use iced::widget::{Space, column, container, image, mouse_area, row, text};
 use iced::{Element, Length};
+use iframe_extract::report::human_bytes;
 
 use crate::theme;
 
@@ -8,6 +9,8 @@ use crate::theme;
 pub struct Thumb {
     pub index: usize,
     pub offset: u64,
+    pub source_size: u64,
+    pub png_size: u64,
     pub partial: bool,
     pub handle: Handle,
 }
@@ -44,6 +47,11 @@ fn thumb_card(
         thumb.offset,
         if thumb.partial { "  partial" } else { "" }
     );
+    let sizes = format!(
+        "src {} → png {}",
+        human_bytes(thumb.source_size),
+        human_bytes(thumb.png_size)
+    );
     let card = column![
         container(image(thumb.handle.clone()).width(Length::Fill).height(108))
             .width(Length::Fill)
@@ -53,10 +61,17 @@ fn thumb_card(
             } else {
                 theme::map_well
             }),
-        text(label)
-            .size(11)
-            .font(iced::Font::MONOSPACE)
-            .color(theme::MUTED),
+        column![
+            text(label)
+                .size(11)
+                .font(iced::Font::MONOSPACE)
+                .color(theme::MUTED),
+            text(sizes)
+                .size(11)
+                .font(iced::Font::MONOSPACE)
+                .color(theme::MUTED),
+        ]
+        .spacing(2),
     ]
     .spacing(6)
     .width(176);
