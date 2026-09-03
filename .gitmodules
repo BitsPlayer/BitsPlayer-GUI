@@ -1,0 +1,6 @@
+[submodule "vendor/iframe-extract"]
+	path = vendor/iframe-extract
+	url = git@github.com:BitsPlayer/IFrameExtract.git
+[submodule "vendor/video-analyzer"]
+	path = vendor/video-analyzer
+	url = git@github.com:BitsPlayer/Video-Analyze.git
