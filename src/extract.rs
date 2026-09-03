@@ -635,15 +635,22 @@ fn run_extract(
     }
     reporter.finish_phase(&format!("{n} frames"));
     let r = &extraction.report;
+    let skipped = match r.skipped_regions {
+        0 => String::new(),
+        n => format!(
+            " · stepped over {n} non-video region(s), {}",
+            iframe_extract::report::human_bytes(r.skipped_bytes)
+        ),
+    };
     let summary = match r.truncation_offset {
         Some(off) => format!(
-            "{} NALs · {} frames · chain broke at {off} ({:.2}% of file)",
+            "{} NALs · {} frames · chain broke at {off} ({:.2}% of file){skipped}",
             r.nal_count,
             frames.len(),
             off as f64 / data.len().max(1) as f64 * 100.0
         ),
         None => format!(
-            "{} NALs · {} frames · chain ran to end of mdat",
+            "{} NALs · {} frames · chain ran to end of mdat{skipped}",
             r.nal_count,
             frames.len()
         ),
