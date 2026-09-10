@@ -49,6 +49,7 @@ pub enum Message {
     Matrix(MatrixChoice),
     ToggleNonIdr(bool),
     TogglePartial(bool),
+    ToggleAudio(bool),
     Run,
     Tick,
     Select(usize),
@@ -121,6 +122,7 @@ pub struct State {
     pub matrix: MatrixChoice,
     pub include_non_idr: bool,
     pub include_partial: bool,
+    pub with_audio: bool,
     pub running: bool,
     pub error: Option<String>,
     pub status: String,
@@ -138,6 +140,7 @@ impl Default for State {
             matrix: MatrixChoice::Bt709,
             include_non_idr: false,
             include_partial: false,
+            with_audio: false,
             running: false,
             error: None,
             status: String::from("Open a truncated MP4, set frame size, then extract"),
@@ -196,6 +199,10 @@ impl State {
             }
             Message::TogglePartial(v) => {
                 self.include_partial = v;
+                Task::none()
+            }
+            Message::ToggleAudio(v) => {
+                self.with_audio = v;
                 Task::none()
             }
             Message::Run => self.start_extract(),
@@ -291,6 +298,7 @@ impl State {
             height,
             include_non_idr: self.include_non_idr,
             include_partial: self.include_partial,
+            with_audio: self.with_audio,
         };
         let matrix = self.matrix.to_matrix();
         let progress = Arc::clone(&self.progress);
@@ -415,6 +423,10 @@ impl State {
                 .text_size(13),
             checkbox("Include partial", self.include_partial)
                 .on_toggle(Message::TogglePartial)
+                .size(16)
+                .text_size(13),
+            checkbox("With audio", self.with_audio)
+                .on_toggle(Message::ToggleAudio)
                 .size(16)
                 .text_size(13),
         ]
