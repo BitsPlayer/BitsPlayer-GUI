@@ -135,6 +135,15 @@ pub fn map_well(_theme: &Theme) -> container::Style {
     }
 }
 
+pub fn hex_well(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG)),
+        text_color: Some(TEXT),
+        border: hairline(),
+        shadow: Shadow::default(),
+    }
+}
+
 pub fn color_chip(color: Color) -> impl Fn(&Theme) -> container::Style {
     move |_theme: &Theme| container::Style {
         background: Some(Background::Color(color)),

@@ -1,19 +1,44 @@
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use bitplay::{Analysis, SpanKind};
+use bitplay::{Analysis, LayoutSpan, SpanKind};
 use iced::widget::canvas::Canvas;
 use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Element, Fill, Font, Task};
 
 use crate::theme;
 use crate::widgets::file_map::{FileMap, MapMessage};
+use crate::widgets::hex_view;
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Browse,
     Finished(Result<Analysis, String>),
     MapHover(Option<String>),
+    MapSelect(usize),
+    HexReady {
+        seq: u64,
+        result: Result<(Vec<u8>, u64), String>,
+    },
+    CloseHex,
     OpenExtract,
+}
+
+enum HexPane {
+    Closed,
+    Loading {
+        span: LayoutSpan,
+    },
+    Ready {
+        span: LayoutSpan,
+        shown: u64,
+        bytes: Arc<Vec<u8>>,
+    },
+    Failed {
+        span: LayoutSpan,
+        error: String,
+    },
 }
 
 pub struct State {
@@ -23,6 +48,8 @@ pub struct State {
     pub analysis: Option<Analysis>,
     pub map: Option<FileMap>,
     pub status: String,
+    hex: HexPane,
+    hex_gen: u64,
 }
 
 impl Default for State {
@@ -34,6 +61,8 @@ impl Default for State {
             analysis: None,
             map: None,
             status: String::from("Open an MP4 to map its layout"),
+            hex: HexPane::Closed,
+            hex_gen: 0,
         }
     }
 }
@@ -51,6 +80,7 @@ impl State {
                 self.path = Some(path.clone());
                 self.busy = true;
                 self.error = None;
+                self.close_hex();
                 self.status = format!("Analyzing {}…", display_name(&path));
                 Task::perform(
                     async move {
@@ -68,6 +98,7 @@ impl State {
             }
             Message::Finished(result) => {
                 self.busy = false;
+                self.close_hex();
                 match result {
                     Ok(analysis) => {
                         self.map = Some(FileMap::from_analysis(&analysis));
@@ -95,6 +126,13 @@ impl State {
             Message::MapHover(status) => {
                 if let Some(line) = status {
                     self.status = line;
+                } else if let Some(span) = self.hex_span() {
+                    self.status = format!(
+                        "{} · off {} (0x{:08X})",
+                        span.status_line(),
+                        span.offset,
+                        span.offset
+                    );
                 } else if let Some(analysis) = &self.analysis {
                     self.status = format!(
                         "{} · {}",
@@ -102,6 +140,29 @@ impl State {
                         bitplay::human_bytes(analysis.file_size)
                     );
                 }
+                Task::none()
+            }
+            Message::MapSelect(index) => self.open_hex(index),
+            Message::HexReady { seq, result } => {
+                if seq != self.hex_gen {
+                    return Task::none();
+                }
+                let HexPane::Loading { span } = &self.hex else {
+                    return Task::none();
+                };
+                let span = span.clone();
+                self.hex = match result {
+                    Ok((bytes, shown)) => HexPane::Ready {
+                        span,
+                        shown,
+                        bytes: Arc::new(bytes),
+                    },
+                    Err(error) => HexPane::Failed { span, error },
+                };
+                Task::none()
+            }
+            Message::CloseHex => {
+                self.close_hex();
                 Task::none()
             }
             Message::OpenExtract => Task::none(),
@@ -120,6 +181,7 @@ impl State {
                 Element::<MapMessage>::from(Canvas::new(map.clone()).width(Fill).height(Fill)).map(
                     |msg| match msg {
                         MapMessage::Hover(s) => Message::MapHover(s),
+                        MapMessage::Select(i) => Message::MapSelect(i),
                     },
                 ),
             )
@@ -149,6 +211,137 @@ impl State {
         let main = column![map, status].height(Fill);
 
         row![rail, main].height(Fill).into()
+    }
+
+    fn open_hex(&mut self, index: usize) -> Task<Message> {
+        let Some(analysis) = &self.analysis else {
+            return Task::none();
+        };
+        let Some(span) = analysis.spans.get(index).cloned() else {
+            return Task::none();
+        };
+        if let Some(map) = &self.map
+            && map.selected == Some(index)
+            && matches!(self.hex, HexPane::Ready { .. } | HexPane::Loading { .. })
+        {
+            return Task::none();
+        }
+        if let Some(map) = &mut self.map {
+            map.selected = Some(index);
+        }
+        self.status = format!(
+            "{} · off {} (0x{:08X})",
+            span.status_line(),
+            span.offset,
+            span.offset
+        );
+        self.hex_gen = self.hex_gen.wrapping_add(1);
+        let seq = self.hex_gen;
+        self.hex = HexPane::Loading { span: span.clone() };
+
+        let Some(path) = self.path.clone() else {
+            self.hex = HexPane::Failed {
+                span,
+                error: String::from("No file path"),
+            };
+            return Task::none();
+        };
+
+        Task::perform(
+            async move {
+                match tokio::task::spawn_blocking(move || {
+                    read_span_hex(&path, span.offset, span.size)
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => Err(e.to_string()),
+                }
+            },
+            move |result| Message::HexReady { seq, result },
+        )
+    }
+
+    fn close_hex(&mut self) {
+        self.hex = HexPane::Closed;
+        if let Some(map) = &mut self.map {
+            map.selected = None;
+        }
+    }
+
+    fn hex_span(&self) -> Option<&LayoutSpan> {
+        match &self.hex {
+            HexPane::Closed => None,
+            HexPane::Loading { span }
+            | HexPane::Ready { span, .. }
+            | HexPane::Failed { span, .. } => Some(span),
+        }
+    }
+
+    pub fn hex_is_open(&self) -> bool {
+        !matches!(self.hex, HexPane::Closed)
+    }
+
+    pub fn hex_title(&self) -> String {
+        match self.hex_span() {
+            Some(span) => format!("Hex · {}", span.kind.label()),
+            None => String::from("Hex"),
+        }
+    }
+
+    pub fn hex_window_view(&self) -> Element<'_, Message> {
+        let (span, body, note) = match &self.hex {
+            HexPane::Closed => {
+                return container(text("No block selected").color(theme::MUTED))
+                    .width(Fill)
+                    .height(Fill)
+                    .center_x(Fill)
+                    .center_y(Fill)
+                    .style(theme::panel)
+                    .into();
+            }
+            HexPane::Loading { span } => (
+                span,
+                text("Reading bytes…")
+                    .size(13)
+                    .font(Font::MONOSPACE)
+                    .color(theme::MUTED)
+                    .into(),
+                None,
+            ),
+            HexPane::Failed { span, error } => {
+                (span, text(error).size(13).color(theme::DANGER).into(), None)
+            }
+            HexPane::Ready { span, shown, bytes } => {
+                let note = (*shown < span.size).then(|| {
+                    format!(
+                        "showing first {} of {}",
+                        bitplay::human_bytes(*shown),
+                        bitplay::human_bytes(span.size)
+                    )
+                });
+                let body: Element<'_, Message> = Element::from(
+                    Canvas::new(hex_view::HexDump {
+                        bytes: Arc::clone(bytes),
+                        base: span.offset,
+                    })
+                    .width(Fill)
+                    .height(Fill),
+                )
+                .map(|()| Message::CloseHex);
+                (span, body, note)
+            }
+        };
+
+        let end = span.offset.saturating_add(span.size);
+        hex_view::window_view(
+            theme::span_color(span.kind),
+            span.status_line(),
+            format!("0x{:08X} – 0x{:08X}", span.offset, end),
+            note,
+            body,
+            Message::CloseHex,
+        )
     }
 
     fn rail(&self) -> Element<'_, Message> {
@@ -217,6 +410,9 @@ impl State {
         column![
             text("No file loaded").size(18).color(theme::TEXT),
             text("Open an MP4 to see how video, audio, and GOPs are laid out.")
+                .size(13)
+                .color(theme::MUTED),
+            text("Click a block to inspect its bytes.")
                 .size(13)
                 .color(theme::MUTED),
             Space::with_height(8),
@@ -301,6 +497,11 @@ fn legend() -> Element<'static, Message> {
         );
     }
     let _ = SpanKind::Ftyp;
+    col = col.push(
+        text("Click a block to inspect bytes")
+            .size(11)
+            .color(theme::MUTED),
+    );
     col.into()
 }
 
@@ -309,4 +510,19 @@ fn display_name(path: &std::path::Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("untitled")
         .to_string()
+}
+
+fn read_span_hex(path: &Path, offset: u64, size: u64) -> Result<(Vec<u8>, u64), String> {
+    let show = size.min(hex_view::MAX_BYTES) as usize;
+    if show == 0 {
+        return Ok((Vec::new(), 0));
+    }
+
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; show];
+    let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+    buf.truncate(n);
+    Ok((buf, n as u64))
 }

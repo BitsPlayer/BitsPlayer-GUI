@@ -10,12 +10,15 @@ use crate::theme;
 #[derive(Debug, Clone)]
 pub enum MapMessage {
     Hover(Option<String>),
+    /// Index into `spans` for the block under the cursor.
+    Select(usize),
 }
 
 #[derive(Debug, Clone)]
 pub struct FileMap {
     pub spans: Arc<Vec<LayoutSpan>>,
     pub file_size: u64,
+    pub selected: Option<usize>,
 }
 
 impl FileMap {
@@ -23,6 +26,7 @@ impl FileMap {
         Self {
             spans: Arc::new(analysis.spans.clone()),
             file_size: analysis.file_size.max(1),
+            selected: None,
         }
     }
 
@@ -56,7 +60,6 @@ impl FileMap {
 #[derive(Debug, Default)]
 pub struct MapState {
     hover: Option<String>,
-    selected: Option<usize>,
 }
 
 const ROW_H: f32 = 12.0;
@@ -170,11 +173,11 @@ impl canvas::Program<MapMessage> for FileMap {
                 (canvas::event::Status::Captured, None)
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                state.selected = span;
-                (
-                    canvas::event::Status::Captured,
-                    Some(MapMessage::Hover(status)),
-                )
+                if let Some(i) = span {
+                    (canvas::event::Status::Captured, Some(MapMessage::Select(i)))
+                } else {
+                    (canvas::event::Status::Captured, None)
+                }
             }
             _ => (canvas::event::Status::Ignored, None),
         }
@@ -182,7 +185,7 @@ impl canvas::Program<MapMessage> for FileMap {
 
     fn draw(
         &self,
-        state: &Self::State,
+        _state: &Self::State,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
@@ -208,7 +211,7 @@ impl canvas::Program<MapMessage> for FileMap {
         let mut pending: Option<(f64, f64, Color)> = None;
         for (i, span) in self.spans.iter().enumerate() {
             let (x0, x1) = ribbon.byte_range(span, self.file_size);
-            let lit = Some(i) == hovered || Some(i) == state.selected;
+            let lit = Some(i) == hovered || Some(i) == self.selected;
             let color = match lit {
                 true => highlight(theme::span_color(span.kind)),
                 false => theme::span_color(span.kind),

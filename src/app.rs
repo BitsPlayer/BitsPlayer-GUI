@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use iced::{Element, Fill, Font, Subscription, Task, Theme};
+use iced::window;
+use iced::{Element, Fill, Font, Size, Subscription, Task, Theme};
 
 use crate::analyze;
 use crate::extract;
@@ -15,43 +16,79 @@ pub enum Tab {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    MainOpened,
+    HexOpened,
+    WindowClosed(window::Id),
     Tab(Tab),
     Analyze(analyze::Message),
     Extract(extract::Message),
 }
 
 pub struct App {
+    main_window: window::Id,
+    hex_window: Option<window::Id>,
     tab: Tab,
     analyze: analyze::State,
     extract: extract::State,
 }
 
-impl Default for App {
-    fn default() -> Self {
-        Self {
-            tab: Tab::Analyze,
-            analyze: analyze::State::default(),
-            extract: extract::State::default(),
+impl App {
+    pub fn boot() -> (Self, Task<Message>) {
+        let (main_window, open) = window::open(window::Settings {
+            size: Size::new(1280.0, 820.0),
+            ..Default::default()
+        });
+        (
+            Self {
+                main_window,
+                hex_window: None,
+                tab: Tab::Analyze,
+                analyze: analyze::State::default(),
+                extract: extract::State::default(),
+            },
+            open.map(|_| Message::MainOpened),
+        )
+    }
+
+    pub fn title(&self, window: window::Id) -> String {
+        if Some(window) == self.hex_window {
+            self.analyze.hex_title()
+        } else {
+            String::from("BitsPlayer")
         }
     }
-}
 
-impl App {
-    pub fn theme(&self) -> Theme {
+    pub fn theme(&self, _window: window::Id) -> Theme {
         theme::bitsplayer_theme()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
+        let closed = window::close_events().map(Message::WindowClosed);
         if self.extract.running {
-            iced::time::every(Duration::from_millis(80))
-                .map(|_| Message::Extract(extract::Message::Tick))
+            Subscription::batch([
+                closed,
+                iced::time::every(Duration::from_millis(80))
+                    .map(|_| Message::Extract(extract::Message::Tick)),
+            ])
         } else {
-            Subscription::none()
+            closed
         }
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::MainOpened | Message::HexOpened => Task::none(),
+            Message::WindowClosed(id) => {
+                if id == self.main_window {
+                    iced::exit()
+                } else if Some(id) == self.hex_window {
+                    self.hex_window = None;
+                    let _ = self.analyze.update(analyze::Message::CloseHex);
+                    Task::none()
+                } else {
+                    Task::none()
+                }
+            }
             Message::Tab(tab) => {
                 self.tab = tab;
                 Task::none()
@@ -63,35 +100,71 @@ impl App {
                     .analysis
                     .as_ref()
                     .and_then(|a| a.video.as_ref())
+                    && v.width > 0
+                    && v.height > 0
                 {
-                    if v.width > 0 && v.height > 0 {
-                        self.extract.prefill(v.width, v.height);
-                    }
+                    self.extract.prefill(v.width, v.height);
                 }
                 Task::none()
             }
-            Message::Analyze(msg) => {
-                let prefill = matches!(&msg, analyze::Message::Finished(Ok(_)));
-                let task = self.analyze.update(msg).map(Message::Analyze);
-                if prefill {
-                    if let Some(v) = self
-                        .analyze
-                        .analysis
-                        .as_ref()
-                        .and_then(|a| a.video.as_ref())
-                    {
-                        if v.width > 0 && v.height > 0 {
-                            self.extract.prefill(v.width, v.height);
-                        }
-                    }
-                }
-                task
-            }
+            Message::Analyze(msg) => self.update_analyze(msg),
             Message::Extract(msg) => self.extract.update(msg).map(Message::Extract),
         }
     }
 
-    pub fn view(&self) -> Element<'_, Message> {
+    fn update_analyze(&mut self, msg: analyze::Message) -> Task<Message> {
+        let selecting = matches!(msg, analyze::Message::MapSelect(_));
+        let prefill = matches!(&msg, analyze::Message::Finished(Ok(_)));
+        let was_open = self.analyze.hex_is_open();
+        let task = self.analyze.update(msg).map(Message::Analyze);
+        if prefill
+            && let Some(v) = self
+                .analyze
+                .analysis
+                .as_ref()
+                .and_then(|a| a.video.as_ref())
+            && v.width > 0
+            && v.height > 0
+        {
+            self.extract.prefill(v.width, v.height);
+        }
+
+        let now_open = self.analyze.hex_is_open();
+        if was_open && !now_open {
+            Task::batch([task, self.close_hex_window()])
+        } else if now_open && (!was_open || selecting) {
+            Task::batch([task, self.ensure_hex_window()])
+        } else {
+            task
+        }
+    }
+
+    fn ensure_hex_window(&mut self) -> Task<Message> {
+        if let Some(id) = self.hex_window {
+            return window::gain_focus(id);
+        }
+        let (id, open) = window::open(window::Settings {
+            size: Size::new(920.0, 640.0),
+            position: window::Position::Centered,
+            min_size: Some(Size::new(520.0, 360.0)),
+            ..Default::default()
+        });
+        self.hex_window = Some(id);
+        open.map(|_| Message::HexOpened)
+    }
+
+    fn close_hex_window(&mut self) -> Task<Message> {
+        match self.hex_window.take() {
+            Some(id) => window::close(id),
+            None => Task::none(),
+        }
+    }
+
+    pub fn view(&self, window: window::Id) -> Element<'_, Message> {
+        if Some(window) == self.hex_window {
+            return self.analyze.hex_window_view().map(Message::Analyze);
+        }
+
         let file_hint = match self.tab {
             Tab::Analyze => self
                 .analyze
