@@ -1,6 +1,7 @@
 mod analyze;
 mod app;
 mod extract;
+mod forensic;
 mod theme;
 mod widgets;
 
