@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -8,15 +9,63 @@ use std::{
 };
 use uuid::Uuid;
 
+use crate::forensic::artifact::ArtifactRecord;
+use crate::forensic::provenance::BuildProvenance;
+
+pub const AUDIT_SCHEMA_VERSION: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AuditAction {
+    CaseCreated,
+    CaseMetadataUpdated,
+    EvidenceRegistered,
+    AnalysisStarted,
+    AnalysisCompleted,
+    AnalysisFailed,
+    IntegrityVerification,
+    ExtractStarted,
+    ExtractCompleted,
+    ExtractFailed,
+    ArtifactCreated,
+    CaseClosed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AuditResult {
+    Started,
+    Success,
+    Failed,
+    Verified,
+    Unverified,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditEntry {
+    pub schema_version: u32,
+    pub sequence: u64,
     pub timestamp: DateTime<Utc>,
     pub case_id: Uuid,
-    pub action: String,
+    pub action: AuditAction,
+    pub result: AuditResult,
+
     pub tool_version: String,
+    pub git_commit: String,
+    pub cargo_lock_sha256: String,
+    pub binary_sha256: String,
+
     pub evidence_filename: Option<String>,
     pub evidence_sha256: Option<String>,
-    pub result: String,
+    pub case_metadata_sha256: Option<String>,
+
+    pub artifact_filename: Option<String>,
+    pub artifact_sha256: Option<String>,
+    pub artifact_type: Option<String>,
+    pub artifact_size_bytes: Option<u64>,
+    pub source_evidence_sha256: Option<String>,
+
     pub previous_entry_hash: Option<String>,
     pub entry_hash: String,
 }
@@ -24,7 +73,10 @@ pub struct AuditEntry {
 #[derive(Debug)]
 pub struct AuditLogger {
     path: PathBuf,
+    file: File,
+    provenance: BuildProvenance,
     last_hash: Option<String>,
+    next_sequence: u64,
 }
 
 #[derive(Debug)]
@@ -32,7 +84,46 @@ pub struct AuditVerification {
     pub valid: bool,
     pub entries_checked: usize,
     pub last_hash: Option<String>,
+    pub last_sequence: u64,
     pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AuditHashPayload<'a> {
+    schema_version: u32,
+    sequence: u64,
+    timestamp: &'a DateTime<Utc>,
+    case_id: Uuid,
+    action: &'a AuditAction,
+    result: &'a AuditResult,
+
+    tool_version: &'a str,
+    git_commit: &'a str,
+    cargo_lock_sha256: &'a str,
+    binary_sha256: &'a str,
+
+    evidence_filename: Option<&'a str>,
+    evidence_sha256: Option<&'a str>,
+    case_metadata_sha256: Option<&'a str>,
+
+    artifact_filename: Option<&'a str>,
+    artifact_sha256: Option<&'a str>,
+    artifact_type: Option<&'a str>,
+    artifact_size_bytes: Option<u64>,
+    source_evidence_sha256: Option<&'a str>,
+
+    previous_entry_hash: Option<&'a str>,
+}
+
+struct AuditFields<'a> {
+    evidence_filename: Option<&'a str>,
+    evidence_sha256: Option<&'a str>,
+    case_metadata_sha256: Option<&'a str>,
+    artifact_filename: Option<&'a str>,
+    artifact_sha256: Option<&'a str>,
+    artifact_type: Option<&'a str>,
+    artifact_size_bytes: Option<u64>,
+    source_evidence_sha256: Option<&'a str>,
 }
 
 impl AuditLogger {
@@ -43,96 +134,224 @@ impl AuditLogger {
             fs::create_dir_all(parent)?;
         }
 
-        let last_hash = if path.exists() {
-            let verification = verify_audit_log(&path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .append(true)
+            .open(&path)?;
 
-            if !verification.valid {
+        file.try_lock_exclusive().map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "audit log is already locked by another process: {}: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+
+        let verification = match verify_audit_log(&path) {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = FileExt::unlock(&file);
+                return Err(err);
+            }
+        };
+
+        if !verification.valid {
+            let message = verification.error.unwrap_or_else(|| {
+                String::from("existing audit log failed verification")
+            });
+            let _ = FileExt::unlock(&file);
+            return Err(io::Error::new(io::ErrorKind::InvalidData, message));
+        }
+
+        let provenance = match BuildProvenance::collect() {
+            Ok(value) => value,
+            Err(err) => {
+                let _ = FileExt::unlock(&file);
                 return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    verification
-                        .error
-                        .unwrap_or_else(|| {
-                            String::from(
-                                "existing audit log failed verification",
-                            )
-                        }),
+                    err.kind(),
+                    format!("failed to collect build provenance: {err}"),
                 ));
             }
-
-            verification.last_hash
-        } else {
-            None
         };
 
         Ok(Self {
             path,
-            last_hash,
+            file,
+            provenance,
+            last_hash: verification.last_hash,
+            next_sequence: verification.last_sequence.saturating_add(1),
         })
     }
 
     pub fn log(
         &mut self,
         case_id: Uuid,
-        action: impl Into<String>,
+        action: AuditAction,
         evidence_filename: Option<String>,
         evidence_sha256: Option<String>,
-        result: impl Into<String>,
+        case_metadata_sha256: Option<String>,
+        result: AuditResult,
+    ) -> io::Result<AuditEntry> {
+        self.log_internal(
+            case_id,
+            action,
+            result,
+            evidence_filename,
+            evidence_sha256,
+            case_metadata_sha256,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn log_artifact(
+        &mut self,
+        case_id: Uuid,
+        evidence_filename: Option<String>,
+        evidence_sha256: Option<String>,
+        artifact: &ArtifactRecord,
+    ) -> io::Result<AuditEntry> {
+        self.log_internal(
+            case_id,
+            AuditAction::ArtifactCreated,
+            AuditResult::Success,
+            evidence_filename,
+            evidence_sha256,
+            None,
+            Some(artifact.filename.clone()),
+            Some(artifact.sha256.clone()),
+            Some(artifact.artifact_type.clone()),
+            Some(artifact.size_bytes),
+            Some(artifact.source_evidence_sha256.clone()),
+        )
+    }
+
+    fn log_internal(
+        &mut self,
+        case_id: Uuid,
+        action: AuditAction,
+        result: AuditResult,
+        evidence_filename: Option<String>,
+        evidence_sha256: Option<String>,
+        case_metadata_sha256: Option<String>,
+        artifact_filename: Option<String>,
+        artifact_sha256: Option<String>,
+        artifact_type: Option<String>,
+        artifact_size_bytes: Option<u64>,
+        source_evidence_sha256: Option<String>,
     ) -> io::Result<AuditEntry> {
         let timestamp = Utc::now();
-        let action = action.into();
-        let result = result.into();
-
+        let sequence = self.next_sequence;
         let previous_entry_hash = self.last_hash.clone();
 
+        let fields = AuditFields {
+            evidence_filename: evidence_filename.as_deref(),
+            evidence_sha256: evidence_sha256.as_deref(),
+            case_metadata_sha256: case_metadata_sha256.as_deref(),
+            artifact_filename: artifact_filename.as_deref(),
+            artifact_sha256: artifact_sha256.as_deref(),
+            artifact_type: artifact_type.as_deref(),
+            artifact_size_bytes,
+            source_evidence_sha256: source_evidence_sha256.as_deref(),
+        };
+
         let entry_hash = calculate_entry_hash(
-            timestamp,
+            AUDIT_SCHEMA_VERSION,
+            sequence,
+            &timestamp,
             case_id,
             &action,
-            env!("CARGO_PKG_VERSION"),
-            evidence_filename.as_deref(),
-            evidence_sha256.as_deref(),
             &result,
+            &self.provenance,
+            &fields,
             previous_entry_hash.as_deref(),
-        );
+        )?;
 
         let entry = AuditEntry {
+            schema_version: AUDIT_SCHEMA_VERSION,
+            sequence,
             timestamp,
             case_id,
             action,
-            tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            result,
+            tool_version: self.provenance.tool_version.clone(),
+            git_commit: self.provenance.git_commit.clone(),
+            cargo_lock_sha256: self.provenance.cargo_lock_sha256.clone(),
+            binary_sha256: self.provenance.binary_sha256.clone(),
             evidence_filename,
             evidence_sha256,
-            result,
+            case_metadata_sha256,
+            artifact_filename,
+            artifact_sha256,
+            artifact_type,
+            artifact_size_bytes,
+            source_evidence_sha256,
             previous_entry_hash,
             entry_hash: entry_hash.clone(),
         };
 
-        let serialized =
-            serde_json::to_string(&entry)
-                .map_err(io::Error::other)?;
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-
-        writeln!(file, "{serialized}")?;
-
-        file.flush()?;
+        let serialized = serde_json::to_string(&entry).map_err(io::Error::other)?;
+        writeln!(self.file, "{serialized}")?;
+        self.file.flush()?;
+        self.file.sync_all()?;
 
         self.last_hash = Some(entry_hash);
+        self.next_sequence = self.next_sequence.saturating_add(1);
 
         Ok(entry)
+    }
+
+    pub fn close_case(
+        &mut self,
+        case_id: Uuid,
+        case_metadata_sha256: Option<String>,
+    ) -> io::Result<AuditEntry> {
+        self.log(
+            case_id,
+            AuditAction::CaseClosed,
+            None,
+            None,
+            case_metadata_sha256,
+            AuditResult::Success,
+        )
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    pub fn last_hash(&self) -> Option<&str> {
+        self.last_hash.as_deref()
+    }
+
+    pub fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
+    pub fn provenance(&self) -> &BuildProvenance {
+        &self.provenance
+    }
 }
 
-pub fn verify_audit_log(
-    path: impl AsRef<Path>,
-) -> io::Result<AuditVerification> {
+impl Drop for AuditLogger {
+    fn drop(&mut self) {
+        if let Err(err) = FileExt::unlock(&self.file) {
+            eprintln!(
+                "Failed to release audit log lock for {}: {err}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+pub fn verify_audit_log(path: impl AsRef<Path>) -> io::Result<AuditVerification> {
     let path = path.as_ref();
 
     if !path.exists() {
@@ -140,6 +359,7 @@ pub fn verify_audit_log(
             valid: true,
             entries_checked: 0,
             last_hash: None,
+            last_sequence: 0,
             error: None,
         });
     }
@@ -148,7 +368,9 @@ pub fn verify_audit_log(
     let reader = BufReader::new(file);
 
     let mut expected_previous_hash: Option<String> = None;
+    let mut expected_sequence = 1u64;
     let mut entries_checked = 0usize;
+    let mut last_sequence = 0u64;
 
     for (index, line) in reader.lines().enumerate() {
         let line = line?;
@@ -157,57 +379,98 @@ pub fn verify_audit_log(
             continue;
         }
 
-        let entry: AuditEntry =
-            match serde_json::from_str(&line) {
-                Ok(entry) => entry,
+        let entry: AuditEntry = match serde_json::from_str(&line) {
+            Ok(entry) => entry,
+            Err(err) => {
+                return Ok(AuditVerification {
+                    valid: false,
+                    entries_checked,
+                    last_hash: expected_previous_hash,
+                    last_sequence,
+                    error: Some(format!(
+                        "invalid audit JSON at line {}: {}",
+                        index + 1,
+                        err
+                    )),
+                });
+            }
+        };
 
-                Err(err) => {
-                    return Ok(AuditVerification {
-                        valid: false,
-                        entries_checked,
-                        last_hash: expected_previous_hash,
-                        error: Some(format!(
-                            "invalid JSON at audit line {}: {}",
-                            index + 1,
-                            err
-                        )),
-                    });
-                }
-            };
-
-        if entry.previous_entry_hash
-            != expected_previous_hash
-        {
+        if entry.schema_version != AUDIT_SCHEMA_VERSION {
             return Ok(AuditVerification {
                 valid: false,
                 entries_checked,
                 last_hash: expected_previous_hash,
+                last_sequence,
                 error: Some(format!(
-                    "audit chain broken at line {}",
+                    "unsupported audit schema version {} at line {}",
+                    entry.schema_version,
                     index + 1
                 )),
             });
         }
 
-        let recalculated_hash =
-            calculate_entry_hash(
-                entry.timestamp,
-                entry.case_id,
-                &entry.action,
-                &entry.tool_version,
-                entry.evidence_filename.as_deref(),
-                entry.evidence_sha256.as_deref(),
-                &entry.result,
-                entry.previous_entry_hash.as_deref(),
-            );
-
-        if recalculated_hash
-            != entry.entry_hash
-        {
+        if entry.sequence != expected_sequence {
             return Ok(AuditVerification {
                 valid: false,
                 entries_checked,
                 last_hash: expected_previous_hash,
+                last_sequence,
+                error: Some(format!(
+                    "audit sequence mismatch at line {}: expected {}, found {}",
+                    index + 1,
+                    expected_sequence,
+                    entry.sequence
+                )),
+            });
+        }
+
+        if entry.previous_entry_hash != expected_previous_hash {
+            return Ok(AuditVerification {
+                valid: false,
+                entries_checked,
+                last_hash: expected_previous_hash,
+                last_sequence,
+                error: Some(format!("audit chain broken at line {}", index + 1)),
+            });
+        }
+
+        let provenance = BuildProvenance {
+            tool_version: entry.tool_version.clone(),
+            git_commit: entry.git_commit.clone(),
+            cargo_lock_sha256: entry.cargo_lock_sha256.clone(),
+            binary_sha256: entry.binary_sha256.clone(),
+        };
+
+        let fields = AuditFields {
+            evidence_filename: entry.evidence_filename.as_deref(),
+            evidence_sha256: entry.evidence_sha256.as_deref(),
+            case_metadata_sha256: entry.case_metadata_sha256.as_deref(),
+            artifact_filename: entry.artifact_filename.as_deref(),
+            artifact_sha256: entry.artifact_sha256.as_deref(),
+            artifact_type: entry.artifact_type.as_deref(),
+            artifact_size_bytes: entry.artifact_size_bytes,
+            source_evidence_sha256: entry.source_evidence_sha256.as_deref(),
+        };
+
+        let recalculated_hash = calculate_entry_hash(
+            entry.schema_version,
+            entry.sequence,
+            &entry.timestamp,
+            entry.case_id,
+            &entry.action,
+            &entry.result,
+            &provenance,
+            &fields,
+            entry.previous_entry_hash.as_deref(),
+        )?;
+
+        if recalculated_hash != entry.entry_hash {
+            return Ok(AuditVerification {
+                valid: false,
+                entries_checked,
+                last_hash: expected_previous_hash,
+                last_sequence,
                 error: Some(format!(
                     "audit entry hash mismatch at line {}",
                     index + 1
@@ -215,9 +478,9 @@ pub fn verify_audit_log(
             });
         }
 
-        expected_previous_hash =
-            Some(entry.entry_hash);
-
+        expected_previous_hash = Some(entry.entry_hash.clone());
+        last_sequence = entry.sequence;
+        expected_sequence = expected_sequence.saturating_add(1);
         entries_checked += 1;
     }
 
@@ -225,302 +488,334 @@ pub fn verify_audit_log(
         valid: true,
         entries_checked,
         last_hash: expected_previous_hash,
+        last_sequence,
         error: None,
     })
 }
 
 fn calculate_entry_hash(
-    timestamp: DateTime<Utc>,
+    schema_version: u32,
+    sequence: u64,
+    timestamp: &DateTime<Utc>,
     case_id: Uuid,
-    action: &str,
-    tool_version: &str,
-    evidence_filename: Option<&str>,
-    evidence_sha256: Option<&str>,
-    result: &str,
+    action: &AuditAction,
+    result: &AuditResult,
+    provenance: &BuildProvenance,
+    fields: &AuditFields<'_>,
     previous_entry_hash: Option<&str>,
-) -> String {
+) -> io::Result<String> {
+    let payload = AuditHashPayload {
+        schema_version,
+        sequence,
+        timestamp,
+        case_id,
+        action,
+        result,
+        tool_version: &provenance.tool_version,
+        git_commit: &provenance.git_commit,
+        cargo_lock_sha256: &provenance.cargo_lock_sha256,
+        binary_sha256: &provenance.binary_sha256,
+        evidence_filename: fields.evidence_filename,
+        evidence_sha256: fields.evidence_sha256,
+        case_metadata_sha256: fields.case_metadata_sha256,
+        artifact_filename: fields.artifact_filename,
+        artifact_sha256: fields.artifact_sha256,
+        artifact_type: fields.artifact_type,
+        artifact_size_bytes: fields.artifact_size_bytes,
+        source_evidence_sha256: fields.source_evidence_sha256,
+        previous_entry_hash,
+    };
+
+    let bytes = serde_json::to_vec(&payload).map_err(io::Error::other)?;
     let mut hasher = Sha256::new();
-
-    hasher.update(timestamp.to_rfc3339());
-    hasher.update(case_id.as_bytes());
-    hasher.update(action.as_bytes());
-    hasher.update(tool_version.as_bytes());
-
-    hasher.update(
-        evidence_filename
-            .unwrap_or("")
-            .as_bytes(),
-    );
-
-    hasher.update(
-        evidence_sha256
-            .unwrap_or("")
-            .as_bytes(),
-    );
-
-    hasher.update(result.as_bytes());
-
-    hasher.update(
-        previous_entry_hash
-            .unwrap_or("")
-            .as_bytes(),
-    );
-
-    hex::encode(hasher.finalize())
+    hasher.update(bytes);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{
-        SystemTime,
-        UNIX_EPOCH,
-    };
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temporary_log(
-        name: &str,
-    ) -> PathBuf {
+    fn temporary_log(name: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-
-        std::env::temp_dir().join(
-            format!(
-                "bitsplayer_{name}_{unique}.jsonl"
-            )
-        )
+        std::env::temp_dir().join(format!("bitsplayer_{name}_{unique}.jsonl"))
     }
 
     #[test]
     fn creates_hash_chained_entries() {
-        let path =
-            temporary_log("audit");
-
-        let case_id =
-            Uuid::new_v4();
-
-        let mut logger =
-            AuditLogger::new(&path)
-                .unwrap();
+        let path = temporary_log("audit");
+        let case_id = Uuid::new_v4();
+        let mut logger = AuditLogger::new(&path).unwrap();
 
         let first = logger
             .log(
                 case_id,
-                "CASE_CREATED",
+                AuditAction::CaseCreated,
                 None,
                 None,
-                "success",
+                Some(String::from("casehash")),
+                AuditResult::Success,
             )
             .unwrap();
 
         let second = logger
             .log(
                 case_id,
-                "EVIDENCE_OPENED",
-                Some(
-                    String::from(
-                        "test.mp4"
-                    )
-                ),
-                Some(
-                    String::from(
-                        "abc123"
-                    )
-                ),
-                "success",
+                AuditAction::EvidenceRegistered,
+                Some(String::from("test.mp4")),
+                Some(String::from("abc123")),
+                None,
+                AuditResult::Success,
             )
             .unwrap();
 
-        assert!(
-            first
-                .previous_entry_hash
-                .is_none()
-        );
-
+        assert_eq!(first.sequence, 1);
+        assert_eq!(second.sequence, 2);
         assert_eq!(
-            second
-                .previous_entry_hash
-                .as_deref(),
-            Some(
-                first
-                    .entry_hash
-                    .as_str()
-            )
+            second.previous_entry_hash.as_deref(),
+            Some(first.entry_hash.as_str())
         );
 
-        fs::remove_file(path)
-            .unwrap();
+        drop(logger);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn verifies_valid_audit_chain() {
-        let path =
-            temporary_log(
-                "verify"
-            );
+        let path = temporary_log("verify");
+        let case_id = Uuid::new_v4();
 
-        let case_id =
-            Uuid::new_v4();
-
-        let mut logger =
-            AuditLogger::new(&path)
+        {
+            let mut logger = AuditLogger::new(&path).unwrap();
+            logger
+                .log(
+                    case_id,
+                    AuditAction::CaseCreated,
+                    None,
+                    None,
+                    Some(String::from("casehash")),
+                    AuditResult::Success,
+                )
                 .unwrap();
-
-        logger
-            .log(
-                case_id,
-                "CASE_CREATED",
-                None,
-                None,
-                "success",
-            )
-            .unwrap();
-
-        logger
-            .log(
-                case_id,
-                "ANALYSIS_COMPLETED",
-                Some(
-                    String::from(
-                        "test.mp4"
-                    )
-                ),
-                Some(
-                    String::from(
-                        "abc123"
-                    )
-                ),
-                "success",
-            )
-            .unwrap();
-
-        let result =
-            verify_audit_log(&path)
+            logger
+                .log(
+                    case_id,
+                    AuditAction::AnalysisCompleted,
+                    Some(String::from("test.mp4")),
+                    Some(String::from("abc123")),
+                    None,
+                    AuditResult::Success,
+                )
                 .unwrap();
+        }
 
+        let result = verify_audit_log(&path).unwrap();
         assert!(result.valid);
-        assert_eq!(
-            result.entries_checked,
-            2
-        );
-
-        fs::remove_file(path)
-            .unwrap();
+        assert_eq!(result.entries_checked, 2);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn resumes_existing_audit_chain() {
-        let path =
-            temporary_log(
-                "resume"
-            );
-
-        let case_id =
-            Uuid::new_v4();
+        let path = temporary_log("resume");
+        let case_id = Uuid::new_v4();
 
         let first_hash = {
-            let mut logger =
-                AuditLogger::new(&path)
-                    .unwrap();
-
+            let mut logger = AuditLogger::new(&path).unwrap();
             logger
                 .log(
                     case_id,
-                    "CASE_CREATED",
+                    AuditAction::CaseCreated,
                     None,
                     None,
-                    "success",
+                    Some(String::from("casehash")),
+                    AuditResult::Success,
                 )
                 .unwrap()
                 .entry_hash
         };
 
-        let mut reopened =
-            AuditLogger::new(&path)
-                .unwrap();
-
-        let second =
-            reopened
-                .log(
-                    case_id,
-                    "EVIDENCE_REGISTERED",
-                    Some(
-                        String::from(
-                            "test.mp4"
-                        )
-                    ),
-                    Some(
-                        String::from(
-                            "abc123"
-                        )
-                    ),
-                    "success",
-                )
-                .unwrap();
+        let mut reopened = AuditLogger::new(&path).unwrap();
+        let second = reopened
+            .log(
+                case_id,
+                AuditAction::EvidenceRegistered,
+                Some(String::from("test.mp4")),
+                Some(String::from("abc123")),
+                None,
+                AuditResult::Success,
+            )
+            .unwrap();
 
         assert_eq!(
-            second
-                .previous_entry_hash
-                .as_deref(),
-            Some(
-                first_hash.as_str()
-            )
+            second.previous_entry_hash.as_deref(),
+            Some(first_hash.as_str())
         );
 
-        fs::remove_file(path)
-            .unwrap();
+        drop(reopened);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn detects_tampered_audit_log() {
-        let path =
-            temporary_log(
-                "tampered"
-            );
+        let path = temporary_log("tampered");
+        let case_id = Uuid::new_v4();
 
-        let case_id =
-            Uuid::new_v4();
-
-        let mut logger =
-            AuditLogger::new(&path)
+        {
+            let mut logger = AuditLogger::new(&path).unwrap();
+            logger
+                .log(
+                    case_id,
+                    AuditAction::CaseCreated,
+                    None,
+                    None,
+                    Some(String::from("casehash")),
+                    AuditResult::Success,
+                )
                 .unwrap();
+        }
+
+        let original = fs::read_to_string(&path).unwrap();
+        let tampered = original.replace("\"result\":\"SUCCESS\"", "\"result\":\"FAILED\"");
+        fs::write(&path, tampered).unwrap();
+
+        assert!(!verify_audit_log(&path).unwrap().valid);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_json_fields() {
+        let path = temporary_log("unknown");
+        let case_id = Uuid::new_v4();
+
+        {
+            let mut logger = AuditLogger::new(&path).unwrap();
+            logger
+                .log(
+                    case_id,
+                    AuditAction::CaseCreated,
+                    None,
+                    None,
+                    Some(String::from("casehash")),
+                    AuditResult::Success,
+                )
+                .unwrap();
+        }
+
+        let original = fs::read_to_string(&path).unwrap();
+        let tampered = original.replace(
+            "\"schema_version\":3",
+            "\"schema_version\":3,\"injected\":\"value\"",
+        );
+        fs::write(&path, tampered).unwrap();
+
+        assert!(!verify_audit_log(&path).unwrap().valid);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn detects_sequence_tampering() {
+        let path = temporary_log("sequence");
+        let case_id = Uuid::new_v4();
+
+        {
+            let mut logger = AuditLogger::new(&path).unwrap();
+            logger
+                .log(
+                    case_id,
+                    AuditAction::CaseCreated,
+                    None,
+                    None,
+                    Some(String::from("casehash")),
+                    AuditResult::Success,
+                )
+                .unwrap();
+        }
+
+        let original = fs::read_to_string(&path).unwrap();
+        let tampered = original.replace("\"sequence\":1", "\"sequence\":99");
+        fs::write(&path, tampered).unwrap();
+
+        assert!(!verify_audit_log(&path).unwrap().valid);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn prevents_two_loggers_from_writing_same_audit() {
+        let path = temporary_log("lock");
+        let first = AuditLogger::new(&path).unwrap();
+        assert!(AuditLogger::new(&path).is_err());
+        drop(first);
+        let reopened = AuditLogger::new(&path);
+        assert!(reopened.is_ok());
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn close_case_writes_final_audit_entry() {
+        let path = temporary_log("close");
+        let case_id = Uuid::new_v4();
+        let mut logger = AuditLogger::new(&path).unwrap();
 
         logger
             .log(
                 case_id,
-                "CASE_CREATED",
+                AuditAction::CaseCreated,
                 None,
                 None,
-                "success",
+                Some(String::from("casehash")),
+                AuditResult::Success,
             )
             .unwrap();
 
-        let original =
-            fs::read_to_string(
-                &path
+        let closed = logger
+            .close_case(case_id, Some(String::from("casehash")))
+            .unwrap();
+        assert_eq!(closed.action, AuditAction::CaseClosed);
+        assert_eq!(closed.sequence, 2);
+        drop(logger);
+        assert!(verify_audit_log(&path).unwrap().valid);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn artifact_fields_are_hash_chained() {
+        let path = temporary_log("artifact");
+        let case_id = Uuid::new_v4();
+        let artifact_path = std::env::temp_dir().join("bitsplayer_fake_frame.png");
+
+        let artifact = ArtifactRecord {
+            path: artifact_path,
+            filename: String::from("frame_00001.png"),
+            artifact_type: String::from("RECOVERED_FRAME_PNG"),
+            size_bytes: 123,
+            sha256: String::from("artifacthash"),
+            source_evidence_sha256: String::from("sourcehash"),
+            created_at: Utc::now(),
+        };
+
+        let mut logger = AuditLogger::new(&path).unwrap();
+        let entry = logger
+            .log_artifact(
+                case_id,
+                Some(String::from("source.mp4")),
+                Some(String::from("sourcehash")),
+                &artifact,
             )
             .unwrap();
 
-        let tampered =
-            original.replace(
-                "\"result\":\"success\"",
-                "\"result\":\"tampered\"",
-            );
+        assert_eq!(entry.action, AuditAction::ArtifactCreated);
+        assert_eq!(entry.artifact_filename.as_deref(), Some("frame_00001.png"));
+        assert_eq!(entry.artifact_sha256.as_deref(), Some("artifacthash"));
+        assert_eq!(entry.source_evidence_sha256.as_deref(), Some("sourcehash"));
 
-        fs::write(
-            &path,
-            tampered,
-        )
-        .unwrap();
-
-        let result =
-            verify_audit_log(&path)
-                .unwrap();
-
-        assert!(!result.valid);
-
-        fs::remove_file(path)
-            .unwrap();
+        drop(logger);
+        assert!(verify_audit_log(&path).unwrap().valid);
+        fs::remove_file(path).unwrap();
     }
 }

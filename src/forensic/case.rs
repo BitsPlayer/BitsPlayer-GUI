@@ -7,8 +7,14 @@ use std::{
 };
 use uuid::Uuid;
 
+use crate::forensic::hashing::sha256_file;
+
+pub const CASE_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Case {
+    pub schema_version: u32,
     pub id: Uuid,
     pub name: String,
     pub created_at: DateTime<Utc>,
@@ -23,6 +29,7 @@ impl Case {
         case_directory: PathBuf,
     ) -> Self {
         Self {
+            schema_version: CASE_SCHEMA_VERSION,
             id: Uuid::new_v4(),
             name: name.into(),
             created_at: Utc::now(),
@@ -49,6 +56,7 @@ impl Case {
             .join(format!("CASE-{short_id}"));
 
         Self {
+            schema_version: CASE_SCHEMA_VERSION,
             id,
             name: name.into(),
             created_at: Utc::now(),
@@ -60,52 +68,108 @@ impl Case {
     pub fn save(&self) -> io::Result<()> {
         fs::create_dir_all(&self.case_directory)?;
 
-        let path = self.case_file_path();
-
         let json = serde_json::to_string_pretty(self)
             .map_err(io::Error::other)?;
 
-        fs::write(path, json)
+        fs::write(
+            self.case_file_path(),
+            json,
+        )
     }
 
     pub fn load(
         path: impl AsRef<Path>,
     ) -> io::Result<Self> {
-        let data = fs::read_to_string(path)?;
+        let data =
+            fs::read_to_string(path)?;
 
-        serde_json::from_str(&data)
-            .map_err(io::Error::other)
+        let case: Self =
+            serde_json::from_str(&data)
+                .map_err(io::Error::other)?;
+
+        if case.schema_version
+            != CASE_SCHEMA_VERSION
+        {
+            return Err(
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported case schema version {}",
+                        case.schema_version
+                    ),
+                ),
+            );
+        }
+
+        Ok(case)
     }
 
-    pub fn case_file_path(&self) -> PathBuf {
-        self.case_directory.join("case.json")
+    pub fn case_file_path(
+        &self,
+    ) -> PathBuf {
+        self.case_directory
+            .join("case.json")
+    }
+
+    pub fn metadata_sha256(
+        &self,
+    ) -> io::Result<String> {
+        sha256_file(
+            &self.case_file_path(),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{
+        SystemTime,
+        UNIX_EPOCH,
+    };
 
-    fn temp_case_dir(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+    fn temp_case_dir(
+        name: &str,
+    ) -> PathBuf {
+        let unique =
+            SystemTime::now()
+                .duration_since(
+                    UNIX_EPOCH,
+                )
+                .unwrap()
+                .as_nanos();
 
         std::env::temp_dir()
-            .join(format!("bitsplayer_{name}_{unique}"))
+            .join(
+                format!(
+                    "bitsplayer_{name}_{unique}"
+                ),
+            )
     }
 
     #[test]
     fn creates_case_with_unique_id() {
         let case = Case::new(
             "Test Case",
-            Some(String::from("Examiner")),
-            PathBuf::from("/tmp/test-case"),
+            Some(
+                String::from(
+                    "Examiner",
+                ),
+            ),
+            PathBuf::from(
+                "/tmp/test-case",
+            ),
         );
 
-        assert_eq!(case.name, "Test Case");
+        assert_eq!(
+            case.schema_version,
+            CASE_SCHEMA_VERSION
+        );
+
+        assert_eq!(
+            case.name,
+            "Test Case"
+        );
 
         assert_eq!(
             case.examiner.as_deref(),
@@ -117,49 +181,76 @@ mod tests {
 
     #[test]
     fn creates_case_inside_base_directory() {
-        let base = temp_case_dir("base");
+        let base =
+            temp_case_dir(
+                "base",
+            );
 
-        let case = Case::new_in_base(
-            "Test Case",
-            None,
-            &base,
-        );
+        let case =
+            Case::new_in_base(
+                "Test Case",
+                None,
+                &base,
+            );
 
         assert!(
             case.case_directory
-                .starts_with(&base)
+                .starts_with(
+                    &base,
+                )
         );
 
-        let folder_name = case
-            .case_directory
-            .file_name()
-            .unwrap()
-            .to_string_lossy();
+        let folder_name =
+            case
+                .case_directory
+                .file_name()
+                .unwrap()
+                .to_string_lossy();
 
         assert!(
-            folder_name.starts_with("CASE-")
+            folder_name
+                .starts_with(
+                    "CASE-",
+                )
         );
     }
 
     #[test]
     fn saves_and_loads_case() {
-        let dir = temp_case_dir("case_save");
+        let dir =
+            temp_case_dir(
+                "case_save",
+            );
 
-        let case = Case::new(
-            "Saved Case",
-            Some(String::from("Test Examiner")),
-            dir.clone(),
-        );
+        let case =
+            Case::new(
+                "Saved Case",
+                Some(
+                    String::from(
+                        "Test Examiner",
+                    ),
+                ),
+                dir.clone(),
+            );
 
         case.save().unwrap();
 
-        let loaded = Case::load(
-            case.case_file_path()
-        )
-        .unwrap();
+        let loaded =
+            Case::load(
+                case.case_file_path(),
+            )
+            .unwrap();
 
-        assert_eq!(loaded.id, case.id);
-        assert_eq!(loaded.name, case.name);
+        assert_eq!(
+            loaded.id,
+            case.id
+        );
+
+        assert_eq!(
+            loaded.name,
+            case.name
+        );
+
         assert_eq!(
             loaded.examiner,
             case.examiner
@@ -170,7 +261,40 @@ mod tests {
             case.case_directory
         );
 
-        fs::remove_dir_all(dir)
-            .unwrap();
+        fs::remove_dir_all(
+            dir,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn hashes_saved_case_metadata() {
+        let dir =
+            temp_case_dir(
+                "case_hash",
+            );
+
+        let case =
+            Case::new(
+                "Hash Test Case",
+                None,
+                dir.clone(),
+            );
+
+        case.save().unwrap();
+
+        let hash =
+            case.metadata_sha256()
+                .unwrap();
+
+        assert_eq!(
+            hash.len(),
+            64
+        );
+
+        fs::remove_dir_all(
+            dir,
+        )
+        .unwrap();
     }
 }

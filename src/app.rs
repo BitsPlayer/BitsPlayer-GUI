@@ -6,8 +6,11 @@ use iced::{Element, Fill, Font, Size, Subscription, Task, Theme};
 
 use crate::analyze;
 use crate::extract;
-use crate::forensic::audit::AuditLogger;
+use crate::forensic::audit::{AuditAction, AuditLogger, AuditResult};
 use crate::forensic::case::Case;
+use crate::forensic::closure::CaseClosure;
+use crate::forensic::evidence::IntegrityStatus;
+use crate::forensic::signing::SigningIdentity;
 use crate::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -33,13 +36,155 @@ pub struct App {
     tab: Tab,
     analyze: analyze::State,
     extract: extract::State,
-
-    // Forensic session state
     case: Case,
     audit: Option<AuditLogger>,
+    case_closed: bool,
 }
 
 impl App {
+    fn close_forensic_case(&mut self) {
+        if self.case_closed {
+            return;
+        }
+
+        let case_metadata_sha256 = match self.case.metadata_sha256() {
+            Ok(hash) => Some(hash),
+            Err(err) => {
+                eprintln!(
+                    "Failed to hash case metadata during closure: {err}"
+                );
+                None
+            }
+        };
+
+        let Some(logger) = self.audit.as_mut() else {
+            eprintln!(
+                "Cannot close forensic case: audit logger unavailable"
+            );
+            return;
+        };
+
+        let closed_entry = match logger.close_case(
+            self.case.id,
+            case_metadata_sha256,
+        ) {
+            Ok(entry) => entry,
+
+            Err(err) => {
+                eprintln!(
+                    "Failed to write CASE_CLOSED audit entry: {err}"
+                );
+                return;
+            }
+        };
+
+        let closure = CaseClosure::new(
+            self.case.id,
+            closed_entry.sequence,
+            closed_entry.entry_hash.clone(),
+        );
+
+        let closure_path = match closure.save(
+            &self.case.case_directory,
+        ) {
+            Ok(path) => path,
+
+            Err(err) => {
+                eprintln!(
+                    "Failed to save case closure record: {err}"
+                );
+                return;
+            }
+        };
+
+        println!(
+            "Forensic case closed: {}",
+            closure_path.display()
+        );
+
+        /*
+         * Re-hash case.json at the exact point the
+         * sealed case is signed.
+         */
+        let case_metadata_sha256 = match self.case.metadata_sha256() {
+            Ok(hash) => hash,
+
+            Err(err) => {
+                eprintln!(
+                    "Failed to hash case metadata for signing: {err}"
+                );
+                return;
+            }
+        };
+
+        /*
+         * The private signing key is loaded from outside
+         * the case directory:
+         *
+         * ~/.config/bitsplayer/signing/private.key
+         */
+        let signing_identity = match SigningIdentity::load_or_create() {
+            Ok(identity) => identity,
+
+            Err(err) => {
+                eprintln!(
+                    "Failed to load/create signing identity: {err}"
+                );
+                return;
+            }
+        };
+
+        /*
+         * Sign the final sealed forensic state.
+         */
+        let signature = match signing_identity.sign_case(
+            self.case.id,
+            closed_entry.sequence,
+            &closed_entry.entry_hash,
+            &case_metadata_sha256,
+        ) {
+            Ok(signature) => signature,
+
+            Err(err) => {
+                eprintln!(
+                    "Failed to sign forensic case: {err}"
+                );
+                return;
+            }
+        };
+
+        /*
+         * case_signature.json contains:
+         *
+         * - case ID
+         * - final sequence
+         * - final audit head hash
+         * - case.json SHA-256
+         * - Ed25519 public key
+         * - Ed25519 signature
+         *
+         * The private key is NOT written into the case.
+         */
+        match signature.save(
+            &self.case.case_directory,
+        ) {
+            Ok(signature_path) => {
+                println!(
+                    "Case signature saved: {}",
+                    signature_path.display()
+                );
+
+                self.case_closed = true;
+            }
+
+            Err(err) => {
+                eprintln!(
+                    "Failed to save case signature: {err}"
+                );
+            }
+        }
+    }
+
     pub fn boot() -> (Self, Task<Message>) {
         let (main_window, open) = window::open(window::Settings {
             size: Size::new(1280.0, 820.0),
@@ -62,6 +207,17 @@ impl App {
             );
         }
 
+        let case_metadata_sha256 = match case.metadata_sha256() {
+            Ok(hash) => Some(hash),
+
+            Err(err) => {
+                eprintln!(
+                    "Failed to hash case metadata: {err}"
+                );
+                None
+            }
+        };
+
         let audit_path = case
             .case_directory
             .join("logs")
@@ -69,8 +225,11 @@ impl App {
 
         let mut audit = match AuditLogger::new(&audit_path) {
             Ok(logger) => Some(logger),
+
             Err(err) => {
-                eprintln!("Failed to initialize audit logger: {err}");
+                eprintln!(
+                    "Failed to initialize audit logger: {err}"
+                );
                 None
             }
         };
@@ -78,12 +237,15 @@ impl App {
         if let Some(logger) = audit.as_mut() {
             if let Err(err) = logger.log(
                 case.id,
-                "CASE_CREATED",
+                AuditAction::CaseCreated,
                 None,
                 None,
-                "success",
+                case_metadata_sha256,
+                AuditResult::Success,
             ) {
-                eprintln!("Failed to write CASE_CREATED audit entry: {err}");
+                eprintln!(
+                    "Failed to write CASE_CREATED audit entry: {err}"
+                );
             }
         }
 
@@ -96,12 +258,16 @@ impl App {
                 extract: extract::State::default(),
                 case,
                 audit,
+                case_closed: false,
             },
             open.map(|_| Message::MainOpened),
         )
     }
 
-    pub fn title(&self, window: window::Id) -> String {
+    pub fn title(
+        &self,
+        window: window::Id,
+    ) -> String {
         if Some(window) == self.hex_window {
             self.analyze.hex_title()
         } else {
@@ -109,13 +275,19 @@ impl App {
         }
     }
 
-    pub fn theme(&self, _window: window::Id) -> Theme {
+    pub fn theme(
+        &self,
+        _window: window::Id,
+    ) -> Theme {
         theme::bitsplayer_theme()
     }
 
-    pub fn subscription(&self) -> Subscription<Message> {
+    pub fn subscription(
+        &self,
+    ) -> Subscription<Message> {
         let closed =
-            window::close_events().map(Message::WindowClosed);
+            window::close_events()
+                .map(Message::WindowClosed);
 
         if self.extract.running {
             Subscription::batch([
@@ -123,11 +295,13 @@ impl App {
                 iced::time::every(
                     Duration::from_millis(80),
                 )
-                .map(|_| {
-                    Message::Extract(
-                        extract::Message::Tick,
-                    )
-                }),
+                .map(
+                    |_| {
+                        Message::Extract(
+                            extract::Message::Tick,
+                        )
+                    },
+                ),
             ])
         } else {
             closed
@@ -140,19 +314,22 @@ impl App {
     ) -> Task<Message> {
         match message {
             Message::MainOpened
-            | Message::HexOpened => Task::none(),
+            | Message::HexOpened => {
+                Task::none()
+            }
 
             Message::WindowClosed(id) => {
                 if id == self.main_window {
+                    self.close_forensic_case();
                     iced::exit()
-                } else if Some(id)
-                    == self.hex_window
-                {
+                } else if Some(id) == self.hex_window {
                     self.hex_window = None;
 
-                    let _ = self.analyze.update(
-                        analyze::Message::CloseHex,
-                    );
+                    let _ = self
+                        .analyze
+                        .update(
+                            analyze::Message::CloseHex,
+                        );
 
                     Task::none()
                 } else {
@@ -168,20 +345,49 @@ impl App {
             Message::Analyze(
                 analyze::Message::OpenExtract,
             ) => {
+                let evidence_verified = self
+                    .analyze
+                    .evidence
+                    .as_ref()
+                    .map(
+                        |evidence| {
+                            evidence.integrity_status
+                                == IntegrityStatus::Verified
+                        },
+                    )
+                    .unwrap_or(false);
+
+                if !evidence_verified {
+                    return Task::none();
+                }
+
+                if let Some(evidence) =
+                    self.analyze.evidence.as_ref()
+                {
+                    self.extract
+                        .set_verified_evidence(
+                            evidence.path.clone(),
+                            evidence.sha256.clone(),
+                        );
+                }
+
                 self.tab = Tab::Extract;
 
                 if let Some(v) = self
                     .analyze
                     .analysis
                     .as_ref()
-                    .and_then(|a| a.video.as_ref())
+                    .and_then(
+                        |a| a.video.as_ref(),
+                    )
                     && v.width > 0
                     && v.height > 0
                 {
-                    self.extract.prefill(
-                        v.width,
-                        v.height,
-                    );
+                    self.extract
+                        .prefill(
+                            v.width,
+                            v.height,
+                        );
                 }
 
                 Task::none()
@@ -192,9 +398,7 @@ impl App {
             }
 
             Message::Extract(msg) => {
-                self.extract
-                    .update(msg)
-                    .map(Message::Extract)
+                self.update_extract(msg)
             }
         }
     }
@@ -209,11 +413,112 @@ impl App {
                 analyze::Message::MapSelect(_)
             );
 
+        if let analyze::Message::EvidenceReady(
+            Ok(ref evidence),
+        ) = msg
+        {
+            let Some(logger) =
+                self.audit.as_mut()
+            else {
+                self.analyze.busy = false;
+
+                self.analyze.error = Some(
+                    String::from(
+                        "Forensic audit logger is unavailable. Analysis aborted.",
+                    ),
+                );
+
+                self.analyze.status =
+                    String::from(
+                        "Analysis blocked: audit unavailable",
+                    );
+
+                return Task::none();
+            };
+
+            if let Err(err) = logger.log(
+                self.case.id,
+                AuditAction::EvidenceRegistered,
+                Some(
+                    evidence.filename.clone(),
+                ),
+                Some(
+                    evidence.sha256.clone(),
+                ),
+                None,
+                AuditResult::Success,
+            ) {
+                self.analyze.busy = false;
+
+                self.analyze.error = Some(
+                    format!(
+                        "Failed to record evidence in forensic audit: {err}"
+                    ),
+                );
+
+                self.analyze.status =
+                    String::from(
+                        "Analysis blocked: audit write failed",
+                    );
+
+                return Task::none();
+            }
+
+            if let Err(err) = logger.log(
+                self.case.id,
+                AuditAction::AnalysisStarted,
+                Some(
+                    evidence.filename.clone(),
+                ),
+                Some(
+                    evidence.sha256.clone(),
+                ),
+                None,
+                AuditResult::Started,
+            ) {
+                self.analyze.busy = false;
+
+                self.analyze.error = Some(
+                    format!(
+                        "Failed to record analysis start in forensic audit: {err}"
+                    ),
+                );
+
+                self.analyze.status =
+                    String::from(
+                        "Analysis blocked: audit write failed",
+                    );
+
+                return Task::none();
+            }
+        }
+
         let finished_successfully =
             matches!(
                 &msg,
-                analyze::Message::Finished(Ok(_))
+                analyze::Message::Finished(
+                    Ok(_)
+                )
             );
+
+        let finished_with_error =
+            matches!(
+                &msg,
+                analyze::Message::Finished(
+                    Err(_)
+                )
+            );
+
+        let failure_message =
+            match &msg {
+                analyze::Message::Finished(
+                    Err(err),
+                ) => Some(
+                    err.clone(),
+                ),
+
+                _ => None,
+            };
 
         let was_open =
             self.analyze.hex_is_open();
@@ -221,24 +526,51 @@ impl App {
         let task =
             self.analyze
                 .update(msg)
-                .map(Message::Analyze);
+                .map(
+                    Message::Analyze,
+                );
 
         if finished_successfully {
             self.audit_analysis_success();
+
+            if let Some(evidence) =
+                self.analyze.evidence.as_ref()
+                && evidence.integrity_status
+                    == IntegrityStatus::Verified
+            {
+                self.extract
+                    .set_verified_evidence(
+                        evidence.path.clone(),
+                        evidence.sha256.clone(),
+                    );
+            }
 
             if let Some(v) = self
                 .analyze
                 .analysis
                 .as_ref()
-                .and_then(|a| a.video.as_ref())
+                .and_then(
+                    |a| a.video.as_ref(),
+                )
                 && v.width > 0
                 && v.height > 0
             {
-                self.extract.prefill(
-                    v.width,
-                    v.height,
-                );
+                self.extract
+                    .prefill(
+                        v.width,
+                        v.height,
+                    );
             }
+        }
+
+        if finished_with_error {
+            self.audit_analysis_failure(
+                failure_message
+                    .as_deref()
+                    .unwrap_or(
+                        "unknown analysis failure",
+                    ),
+            );
         }
 
         let now_open =
@@ -261,9 +593,245 @@ impl App {
         }
     }
 
-    fn audit_analysis_success(&mut self) {
+    fn update_extract(
+        &mut self,
+        msg: extract::Message,
+    ) -> Task<Message> {
+        if matches!(
+            msg,
+            extract::Message::Run
+        ) {
+            if let Err(err) =
+                self.extract
+                    .validate_forensic_run()
+            {
+                self.extract.error =
+                    Some(err.clone());
+
+                self.extract.status =
+                    err;
+
+                return Task::none();
+            }
+
+            let (filename, sha256) =
+                self.extract_evidence_identity();
+
+            let Some(logger) =
+                self.audit.as_mut()
+            else {
+                self.extract.error = Some(
+                    String::from(
+                        "Forensic audit logger is unavailable. Extraction aborted.",
+                    ),
+                );
+
+                self.extract.status =
+                    String::from(
+                        "Extraction blocked: audit unavailable",
+                    );
+
+                return Task::none();
+            };
+
+            if let Err(err) = logger.log(
+                self.case.id,
+                AuditAction::ExtractStarted,
+                filename,
+                sha256,
+                None,
+                AuditResult::Started,
+            ) {
+                self.extract.error = Some(
+                    format!(
+                        "Failed to record extraction start in forensic audit: {err}"
+                    ),
+                );
+
+                self.extract.status =
+                    String::from(
+                        "Extraction blocked: audit write failed",
+                    );
+
+                return Task::none();
+            }
+        }
+
+        let was_running =
+            self.extract.running;
+
+        let is_tick =
+            matches!(
+                msg,
+                extract::Message::Tick
+            );
+
+        let is_save =
+            matches!(
+                msg,
+                extract::Message::Save
+            );
+
+        let task =
+            self.extract
+                .update(msg)
+                .map(
+                    Message::Extract,
+                );
+
+        if is_tick
+            && was_running
+            && !self.extract.running
+        {
+            let failed =
+                self.extract.error.is_some();
+
+            let (filename, sha256) =
+                self.extract_evidence_identity();
+
+            if let Some(logger) =
+                self.audit.as_mut()
+            {
+                let result =
+                    logger.log(
+                        self.case.id,
+
+                        if failed {
+                            AuditAction::ExtractFailed
+                        } else {
+                            AuditAction::ExtractCompleted
+                        },
+
+                        filename,
+
+                        sha256,
+
+                        None,
+
+                        if failed {
+                            AuditResult::Failed
+                        } else {
+                            AuditResult::Success
+                        },
+                    );
+
+                if let Err(err) = result {
+                    self.extract.error = Some(
+                        format!(
+                            "Extraction finished, but the forensic audit write failed: {err}"
+                        ),
+                    );
+
+                    self.extract.status =
+                        String::from(
+                            "Extraction audit failure",
+                        );
+                }
+            }
+        }
+
+        if is_save {
+            self.audit_saved_artifacts();
+        }
+
+        task
+    }
+
+    fn extract_evidence_identity(
+        &self,
+    ) -> (
+        Option<String>,
+        Option<String>,
+    ) {
+        let filename =
+            self.extract
+                .path
+                .as_ref()
+                .and_then(
+                    |p| p.file_name(),
+                )
+                .and_then(
+                    |s| s.to_str(),
+                )
+                .map(
+                    ToOwned::to_owned,
+                );
+
+        let sha256 =
+            self.extract
+                .source_evidence_sha256
+                .clone();
+
+        (
+            filename,
+            sha256,
+        )
+    }
+
+    fn audit_saved_artifacts(
+        &mut self,
+    ) {
+        let artifacts =
+            self.extract
+                .artifacts()
+                .to_vec();
+
+        if artifacts.is_empty() {
+            return;
+        }
+
+        let (filename, sha256) =
+            self.extract_evidence_identity();
+
+        let Some(logger) =
+            self.audit.as_mut()
+        else {
+            self.extract.error = Some(
+                String::from(
+                    "Artifacts were saved, but the forensic audit logger is unavailable.",
+                ),
+            );
+
+            self.extract.status =
+                String::from(
+                    "Artifact audit failure",
+                );
+
+            return;
+        };
+
+        for artifact in &artifacts {
+            if let Err(err) =
+                logger.log_artifact(
+                    self.case.id,
+                    filename.clone(),
+                    sha256.clone(),
+                    artifact,
+                )
+            {
+                self.extract.error = Some(
+                    format!(
+                        "Artifact was saved, but ARTIFACT_CREATED could not be logged: {err}"
+                    ),
+                );
+
+                self.extract.status =
+                    String::from(
+                        "Artifact audit failure",
+                    );
+
+                return;
+            }
+        }
+    }
+
+    fn audit_analysis_success(
+        &mut self,
+    ) {
         let Some(evidence) =
-            self.analyze.evidence.as_ref()
+            self.analyze
+                .evidence
+                .as_ref()
         else {
             return;
         };
@@ -276,30 +844,15 @@ impl App {
 
         if let Err(err) = logger.log(
             self.case.id,
-            "EVIDENCE_REGISTERED",
+            AuditAction::AnalysisCompleted,
             Some(
-                evidence.filename.clone()
+                evidence.filename.clone(),
             ),
             Some(
-                evidence.sha256.clone()
+                evidence.sha256.clone(),
             ),
-            "success",
-        ) {
-            eprintln!(
-                "Failed to write EVIDENCE_REGISTERED audit entry: {err}"
-            );
-        }
-
-        if let Err(err) = logger.log(
-            self.case.id,
-            "ANALYSIS_COMPLETED",
-            Some(
-                evidence.filename.clone()
-            ),
-            Some(
-                evidence.sha256.clone()
-            ),
-            "success",
+            None,
+            AuditResult::Success,
         ) {
             eprintln!(
                 "Failed to write ANALYSIS_COMPLETED audit entry: {err}"
@@ -307,21 +860,30 @@ impl App {
         }
 
         let integrity_result =
-            if evidence.integrity_verified {
-                "verified"
-            } else {
-                "failed"
+            match evidence.integrity_status {
+                IntegrityStatus::Verified => {
+                    AuditResult::Verified
+                }
+
+                IntegrityStatus::Failed => {
+                    AuditResult::Failed
+                }
+
+                IntegrityStatus::Unverified => {
+                    AuditResult::Unverified
+                }
             };
 
         if let Err(err) = logger.log(
             self.case.id,
-            "INTEGRITY_VERIFICATION",
+            AuditAction::IntegrityVerification,
             Some(
-                evidence.filename.clone()
+                evidence.filename.clone(),
             ),
             Some(
-                evidence.sha256.clone()
+                evidence.sha256.clone(),
             ),
+            None,
             integrity_result,
         ) {
             eprintln!(
@@ -330,32 +892,84 @@ impl App {
         }
     }
 
+    fn audit_analysis_failure(
+        &mut self,
+        failure: &str,
+    ) {
+        let Some(logger) =
+            self.audit.as_mut()
+        else {
+            return;
+        };
+
+        let (filename, sha256) =
+            match self.analyze
+                .evidence
+                .as_ref()
+            {
+                Some(evidence) => (
+                    Some(
+                        evidence.filename.clone(),
+                    ),
+                    Some(
+                        evidence.sha256.clone(),
+                    ),
+                ),
+
+                None => (
+                    None,
+                    None,
+                ),
+            };
+
+        if let Err(err) = logger.log(
+            self.case.id,
+            AuditAction::AnalysisFailed,
+            filename,
+            sha256,
+            None,
+            AuditResult::Failed,
+        ) {
+            eprintln!(
+                "Failed to write ANALYSIS_FAILED audit entry: {err}"
+            );
+        }
+
+        eprintln!(
+            "Analysis failure recorded: {failure}"
+        );
+    }
+
     fn ensure_hex_window(
         &mut self,
     ) -> Task<Message> {
         if let Some(id) =
             self.hex_window
         {
-            return window::gain_focus(id);
+            return window::gain_focus(
+                id,
+            );
         }
 
         let (id, open) =
             window::open(
                 window::Settings {
-                    size: Size::new(
-                        920.0,
-                        640.0,
-                    ),
+                    size:
+                        Size::new(
+                            920.0,
+                            640.0,
+                        ),
 
                     position:
                         window::Position::Centered,
 
-                    min_size: Some(
-                        Size::new(
-                            520.0,
-                            360.0,
+                    min_size:
+                        Some(
+                            Size::new(
+                                520.0,
+                                360.0,
+                            ),
                         ),
-                    ),
 
                     ..Default::default()
                 },
@@ -365,7 +979,7 @@ impl App {
             Some(id);
 
         open.map(
-            |_| Message::HexOpened
+            |_| Message::HexOpened,
         )
     }
 
@@ -377,7 +991,9 @@ impl App {
                 window::close(id)
             }
 
-            None => Task::none(),
+            None => {
+                Task::none()
+            }
         }
     }
 
@@ -391,34 +1007,46 @@ impl App {
             return self
                 .analyze
                 .hex_window_view()
-                .map(Message::Analyze);
+                .map(
+                    Message::Analyze,
+                );
         }
 
         let file_hint =
             match self.tab {
-                Tab::Analyze => self
-                    .analyze
-                    .path
-                    .as_ref()
-                    .and_then(
-                        |p| p.file_name()
-                    )
-                    .and_then(
-                        |s| s.to_str()
-                    )
-                    .unwrap_or(""),
+                Tab::Analyze => {
+                    self.analyze
+                        .path
+                        .as_ref()
+                        .and_then(
+                            |p| {
+                                p.file_name()
+                            },
+                        )
+                        .and_then(
+                            |s| {
+                                s.to_str()
+                            },
+                        )
+                        .unwrap_or("")
+                }
 
-                Tab::Extract => self
-                    .extract
-                    .path
-                    .as_ref()
-                    .and_then(
-                        |p| p.file_name()
-                    )
-                    .and_then(
-                        |s| s.to_str()
-                    )
-                    .unwrap_or(""),
+                Tab::Extract => {
+                    self.extract
+                        .path
+                        .as_ref()
+                        .and_then(
+                            |p| {
+                                p.file_name()
+                            },
+                        )
+                        .and_then(
+                            |s| {
+                                s.to_str()
+                            },
+                        )
+                        .unwrap_or("")
+                }
             };
 
         let header =
@@ -426,80 +1054,86 @@ impl App {
                 iced::widget::row![
                     iced::widget::column![
                         iced::widget::text(
-                            "BitsPlayer"
+                            "BitsPlayer",
                         )
                         .size(20)
                         .color(
-                            theme::TEXT
+                            theme::TEXT,
                         ),
 
                         iced::widget::text(
-                            "MP4 forensics"
+                            "MP4 forensics",
                         )
                         .size(12)
                         .color(
-                            theme::MUTED
+                            theme::MUTED,
                         ),
                     ]
                     .spacing(2),
 
                     iced::widget::Space::with_width(
-                        24
+                        24,
                     ),
 
                     tab_btn(
                         "Analyze",
                         Tab::Analyze,
-                        self.tab
+                        self.tab,
                     ),
 
                     tab_btn(
                         "Extract",
                         Tab::Extract,
-                        self.tab
+                        self.tab,
                     ),
 
                     iced::widget::Space::with_width(
-                        Fill
+                        Fill,
                     ),
 
                     iced::widget::text(
-                        file_hint
+                        file_hint,
                     )
                     .size(12)
                     .font(
-                        Font::MONOSPACE
+                        Font::MONOSPACE,
                     )
                     .color(
-                        theme::MUTED
+                        theme::MUTED,
                     ),
                 ]
                 .spacing(8)
                 .align_y(
-                    iced::Alignment::Center
+                    iced::Alignment::Center,
                 ),
             )
-            .padding([12, 16])
+            .padding([
+                12,
+                16,
+            ])
             .width(Fill)
             .style(
-                theme::header_bar
+                theme::header_bar,
             );
 
-        let body: Element<_> =
+        let body:
+            Element<_> =
             match self.tab {
-                Tab::Analyze => self
-                    .analyze
-                    .view()
-                    .map(
-                        Message::Analyze
-                    ),
+                Tab::Analyze => {
+                    self.analyze
+                        .view()
+                        .map(
+                            Message::Analyze,
+                        )
+                }
 
-                Tab::Extract => self
-                    .extract
-                    .view()
-                    .map(
-                        Message::Extract
-                    ),
+                Tab::Extract => {
+                    self.extract
+                        .view()
+                        .map(
+                            Message::Extract,
+                        )
+                }
             };
 
         iced::widget::column![
@@ -517,17 +1151,22 @@ fn tab_btn(
     current: Tab,
 ) -> Element<'static, Message> {
     iced::widget::button(
-        iced::widget::text(label)
-            .size(14),
+        iced::widget::text(
+            label,
+        )
+        .size(14),
     )
     .on_press(
-        Message::Tab(tab)
+        Message::Tab(tab),
     )
     .style(
         theme::tab_button(
-            tab == current
-        )
+            tab == current,
+        ),
     )
-    .padding([8, 16])
+    .padding([
+        8,
+        16,
+    ])
     .into()
 }
