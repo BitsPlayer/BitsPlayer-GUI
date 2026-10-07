@@ -2,6 +2,7 @@ pub mod artifact;
 pub mod audit;
 pub mod case;
 pub mod closure;
+pub mod context;
 pub mod evidence;
 pub mod hashing;
 pub mod provenance;

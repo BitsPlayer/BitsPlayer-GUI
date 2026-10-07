@@ -28,6 +28,8 @@ use crate::forensic::artifact::{
 
 };
 
+use crate::forensic::context::ExtractionParameters;
+
 use crate::theme;
 
 use crate::widgets::frame_grid::{self, Thumb};
@@ -297,6 +299,29 @@ impl Default for State {
 }
 
 impl State {
+
+    pub fn forensic_parameters(&self) -> Result<ExtractionParameters, String> {
+        let width = self
+            .width
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| String::from("Invalid extraction width"))?;
+
+        let height = self
+            .height
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| String::from("Invalid extraction height"))?;
+
+        Ok(ExtractionParameters {
+            width,
+            height,
+            matrix: self.matrix.to_string(),
+            include_non_idr: self.include_non_idr,
+            include_partial: self.include_partial,
+            with_audio: self.with_audio,
+        })
+    }
 
     pub fn validate_forensic_run(&self) -> Result<(), String> {
         if self.running {

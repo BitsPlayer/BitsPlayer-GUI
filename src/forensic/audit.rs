@@ -10,9 +10,10 @@ use std::{
 use uuid::Uuid;
 
 use crate::forensic::artifact::ArtifactRecord;
+use crate::forensic::context::{HostContext, OperationContext};
 use crate::forensic::provenance::BuildProvenance;
 
-pub const AUDIT_SCHEMA_VERSION: u32 = 3;
+pub const AUDIT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -66,6 +67,9 @@ pub struct AuditEntry {
     pub artifact_size_bytes: Option<u64>,
     pub source_evidence_sha256: Option<String>,
 
+    pub host_context: HostContext,
+    pub operation_context: Option<OperationContext>,
+
     pub previous_entry_hash: Option<String>,
     pub entry_hash: String,
 }
@@ -75,6 +79,7 @@ pub struct AuditLogger {
     path: PathBuf,
     file: File,
     provenance: BuildProvenance,
+    host_context: HostContext,
     last_hash: Option<String>,
     next_sequence: u64,
 }
@@ -111,6 +116,9 @@ struct AuditHashPayload<'a> {
     artifact_type: Option<&'a str>,
     artifact_size_bytes: Option<u64>,
     source_evidence_sha256: Option<&'a str>,
+
+    host_context: &'a HostContext,
+    operation_context: Option<&'a OperationContext>,
 
     previous_entry_hash: Option<&'a str>,
 }
@@ -178,10 +186,13 @@ impl AuditLogger {
             }
         };
 
+        let host_context = HostContext::collect();
+
         Ok(Self {
             path,
             file,
             provenance,
+            host_context,
             last_hash: verification.last_hash,
             next_sequence: verification.last_sequence.saturating_add(1),
         })
@@ -208,6 +219,33 @@ impl AuditLogger {
             None,
             None,
             None,
+            None,
+        )
+    }
+
+    pub fn log_with_context(
+        &mut self,
+        case_id: Uuid,
+        action: AuditAction,
+        evidence_filename: Option<String>,
+        evidence_sha256: Option<String>,
+        case_metadata_sha256: Option<String>,
+        result: AuditResult,
+        operation_context: OperationContext,
+    ) -> io::Result<AuditEntry> {
+        self.log_internal(
+            case_id,
+            action,
+            result,
+            evidence_filename,
+            evidence_sha256,
+            case_metadata_sha256,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(operation_context),
         )
     }
 
@@ -217,6 +255,23 @@ impl AuditLogger {
         evidence_filename: Option<String>,
         evidence_sha256: Option<String>,
         artifact: &ArtifactRecord,
+    ) -> io::Result<AuditEntry> {
+        self.log_artifact_with_context(
+            case_id,
+            evidence_filename,
+            evidence_sha256,
+            artifact,
+            None,
+        )
+    }
+
+    pub fn log_artifact_with_context(
+        &mut self,
+        case_id: Uuid,
+        evidence_filename: Option<String>,
+        evidence_sha256: Option<String>,
+        artifact: &ArtifactRecord,
+        operation_context: Option<OperationContext>,
     ) -> io::Result<AuditEntry> {
         self.log_internal(
             case_id,
@@ -230,6 +285,7 @@ impl AuditLogger {
             Some(artifact.artifact_type.clone()),
             Some(artifact.size_bytes),
             Some(artifact.source_evidence_sha256.clone()),
+            operation_context,
         )
     }
 
@@ -246,6 +302,7 @@ impl AuditLogger {
         artifact_type: Option<String>,
         artifact_size_bytes: Option<u64>,
         source_evidence_sha256: Option<String>,
+        operation_context: Option<OperationContext>,
     ) -> io::Result<AuditEntry> {
         let timestamp = Utc::now();
         let sequence = self.next_sequence;
@@ -271,6 +328,8 @@ impl AuditLogger {
             &result,
             &self.provenance,
             &fields,
+            &self.host_context,
+            operation_context.as_ref(),
             previous_entry_hash.as_deref(),
         )?;
 
@@ -293,6 +352,8 @@ impl AuditLogger {
             artifact_type,
             artifact_size_bytes,
             source_evidence_sha256,
+            host_context: self.host_context.clone(),
+            operation_context,
             previous_entry_hash,
             entry_hash: entry_hash.clone(),
         };
@@ -462,6 +523,8 @@ pub fn verify_audit_log(path: impl AsRef<Path>) -> io::Result<AuditVerification>
             &entry.result,
             &provenance,
             &fields,
+            &entry.host_context,
+            entry.operation_context.as_ref(),
             entry.previous_entry_hash.as_deref(),
         )?;
 
@@ -502,6 +565,8 @@ fn calculate_entry_hash(
     result: &AuditResult,
     provenance: &BuildProvenance,
     fields: &AuditFields<'_>,
+    host_context: &HostContext,
+    operation_context: Option<&OperationContext>,
     previous_entry_hash: Option<&str>,
 ) -> io::Result<String> {
     let payload = AuditHashPayload {
@@ -523,6 +588,8 @@ fn calculate_entry_hash(
         artifact_type: fields.artifact_type,
         artifact_size_bytes: fields.artifact_size_bytes,
         source_evidence_sha256: fields.source_evidence_sha256,
+        host_context,
+        operation_context,
         previous_entry_hash,
     };
 
@@ -708,8 +775,8 @@ mod tests {
 
         let original = fs::read_to_string(&path).unwrap();
         let tampered = original.replace(
-            "\"schema_version\":3",
-            "\"schema_version\":3,\"injected\":\"value\"",
+            "\"schema_version\":4",
+            "\"schema_version\":4,\"injected\":\"value\"",
         );
         fs::write(&path, tampered).unwrap();
 
@@ -818,4 +885,36 @@ mod tests {
         assert!(verify_audit_log(&path).unwrap().valid);
         fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn operation_context_is_hash_chained() {
+        let path = temporary_log("context");
+        let case_id = Uuid::new_v4();
+        let mut logger = AuditLogger::new(&path).unwrap();
+
+        let entry = logger
+            .log_with_context(
+                case_id,
+                AuditAction::AnalysisStarted,
+                Some(String::from("evidence.mp4")),
+                Some(String::from("abc123")),
+                None,
+                AuditResult::Started,
+                OperationContext::evidence(Path::new("/tmp/evidence.mp4")),
+            )
+            .unwrap();
+
+        assert_eq!(
+            entry
+                .operation_context
+                .as_ref()
+                .and_then(|context| context.evidence_path.as_deref()),
+            Some("/tmp/evidence.mp4")
+        );
+
+        drop(logger);
+        assert!(verify_audit_log(&path).unwrap().valid);
+        fs::remove_file(path).unwrap();
+    }
+
 }
