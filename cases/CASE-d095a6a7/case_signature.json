@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "algorithm": "Ed25519",
+  "case_id": "d095a6a7-a73d-4b38-925d-864ab12744ca",
+  "final_sequence": 12,
+  "final_head_hash": "46157737faad3b8ea3efc53dc1a9128652cbf5a7e322bcd08cb5074c6be7d939",
+  "case_metadata_sha256": "1b0fe779abe6902d67d394177a661a7ba3c98650f998af7bea12cd67de11fcfb",
+  "public_key": "uLspcrvMkxuvZbcjZIW0kzeuXP+mrJDYLvSgvoL3Wu0=",
+  "signature": "9cJFISS5qjsUSwX+RwuKTl3vz+d1R1SB9qIfB9/LunWT9TFIwpo3975IBRJnNNJbCyB/fK4lp8XYowwnfk7ABQ=="
+}
