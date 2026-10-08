@@ -24,7 +24,7 @@ use crate::forensic::context::{HostContext, OperationContext};
 
 use crate::forensic::provenance::BuildProvenance;
 
-pub const AUDIT_SCHEMA_VERSION: u32 = 6;
+pub const AUDIT_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 
@@ -36,7 +36,11 @@ pub enum AuditAction {
 
     CaseMetadataUpdated,
 
+    EvidenceCopyStarted,
+
     EvidenceCopyCompleted,
+
+    EvidenceCopyFailed,
 
     EvidenceRegistered,
 
@@ -68,6 +72,14 @@ pub struct EvidenceCopyContext {
     pub original_sha256: String,
     pub working_copy_sha256: String,
     pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CopyAttemptContext {
+    pub source_path: String,
+    pub destination_path: String,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +146,9 @@ pub struct AuditEntry {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_context: Option<EvidenceCopyContext>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_attempt_context: Option<CopyAttemptContext>,
 
     pub previous_entry_hash: Option<String>,
 
@@ -221,6 +236,9 @@ struct AuditHashPayload<'a> {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     copy_context: Option<&'a EvidenceCopyContext>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copy_attempt_context: Option<&'a CopyAttemptContext>,
 
     previous_entry_hash: Option<&'a str>,
 
@@ -402,6 +420,8 @@ let host_context = HostContext::collect();
 
             None,
 
+            None,
+
         )
 
     }
@@ -451,6 +471,8 @@ let host_context = HostContext::collect();
             None,
 
             Some(operation_context),
+
+            None,
 
             None,
 
@@ -532,6 +554,8 @@ let host_context = HostContext::collect();
 
             None,
 
+            None,
+
         )
 
     }
@@ -550,6 +574,25 @@ let host_context = HostContext::collect();
                 .map(|name| name.to_string_lossy().into_owned()),
             Some(context.original_sha256.clone()),
             None, None, None, None, None, None, None,
+            Some(context),
+            None,
+        )
+    }
+
+    pub fn log_copy_attempt(
+        &mut self,
+        case_id: Uuid,
+        action: AuditAction,
+        context: CopyAttemptContext,
+    ) -> io::Result<AuditEntry> {
+        let result = match action {
+            AuditAction::EvidenceCopyStarted if context.error.is_none() => AuditResult::Started,
+            AuditAction::EvidenceCopyFailed if context.error.as_deref().is_some_and(|s| !s.trim().is_empty()) => AuditResult::Failed,
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid copy lifecycle action/context")),
+        };
+        self.log_internal(
+            case_id, action, result,
+            None, None, None, None, None, None, None, None, None, None,
             Some(context),
         )
     }
@@ -583,6 +626,8 @@ let host_context = HostContext::collect();
         operation_context: Option<OperationContext>,
 
         copy_context: Option<EvidenceCopyContext>,
+
+        copy_attempt_context: Option<CopyAttemptContext>,
 
     ) -> io::Result<AuditEntry> {
 
@@ -636,6 +681,8 @@ let entry_hash = calculate_entry_hash(
 
             copy_context.as_ref(),
 
+            copy_attempt_context.as_ref(),
+
             previous_entry_hash.as_deref(),
 
         )?;
@@ -683,6 +730,8 @@ let entry = AuditEntry {
             operation_context,
 
             copy_context,
+
+            copy_attempt_context,
 
             previous_entry_hash,
 
@@ -856,7 +905,7 @@ let entry: AuditEntry = match serde_json::from_str(&line) {
 
         };
 
-        if entry.schema_version != 4 && entry.schema_version != 5 && entry.schema_version != 6 {
+        if entry.schema_version != 4 && entry.schema_version != 5 && entry.schema_version != 6 && entry.schema_version != 7 {
 
             return Ok(AuditVerification {
 
@@ -984,6 +1033,8 @@ let recalculated_hash = calculate_entry_hash(
 
             entry.copy_context.as_ref(),
 
+            entry.copy_attempt_context.as_ref(),
+
             entry.previous_entry_hash.as_deref(),
 
         )?;
@@ -1062,6 +1113,8 @@ fn calculate_entry_hash(
 
     copy_context: Option<&EvidenceCopyContext>,
 
+    copy_attempt_context: Option<&CopyAttemptContext>,
+
     previous_entry_hash: Option<&str>,
 
 ) -> io::Result<String> {
@@ -1109,6 +1162,8 @@ let payload = AuditHashPayload {
         operation_context,
 
         copy_context,
+
+        copy_attempt_context,
 
         previous_entry_hash,
 
@@ -1727,6 +1782,44 @@ let entry = logger
         let data = fs::read_to_string(&path).unwrap();
         fs::write(&path, data.replace("/tmp/working.mp4", "/tmp/tampered.mp4")).unwrap();
         assert!(!verify_audit_log(&path).unwrap().valid);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn copy_attempt_context_is_hash_chained() {
+        let path = temporary_log("copy_attempt");
+        let id = Uuid::new_v4();
+        let mut logger = AuditLogger::new(&path).unwrap();
+        let ctx = CopyAttemptContext {
+            source_path: "/tmp/source.mp4".into(),
+            destination_path: "evidence/working.mp4".into(),
+            error: None,
+        };
+        logger.log_copy_attempt(id, AuditAction::EvidenceCopyStarted, ctx.clone()).unwrap();
+        logger.log_copy_attempt(id, AuditAction::EvidenceCopyFailed, CopyAttemptContext {
+            error: Some("source unreadable".into()),
+            ..ctx
+        }).unwrap();
+        drop(logger);
+        assert!(verify_audit_log(&path).unwrap().valid);
+        let data = fs::read_to_string(&path).unwrap();
+        assert!(data.contains("source unreadable"));
+        fs::write(&path, data.replace("source unreadable", "tampered failure")).unwrap();
+        assert!(!verify_audit_log(&path).unwrap().valid);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn refuses_invalid_copy_attempt_context() {
+        let path = temporary_log("copy_invalid");
+        let id = Uuid::new_v4();
+        let mut logger = AuditLogger::new(&path).unwrap();
+        assert!(logger.log_copy_attempt(id, AuditAction::EvidenceCopyFailed, CopyAttemptContext {
+            source_path: "/tmp/source.mp4".into(),
+            destination_path: "evidence/working.mp4".into(),
+            error: None,
+        }).is_err());
+        drop(logger);
         fs::remove_file(path).unwrap();
     }
 

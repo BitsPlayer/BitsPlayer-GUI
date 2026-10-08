@@ -24,7 +24,7 @@ use std::{
 
 use uuid::Uuid;
 
-const AUDIT_SCHEMA_VERSION: u32 = 6;
+const AUDIT_SCHEMA_VERSION: u32 = 7;
 
 const CASE_SCHEMA_VERSION: u32 = 1;
 
@@ -42,7 +42,11 @@ enum AuditAction {
 
     CaseMetadataUpdated,
 
+    EvidenceCopyStarted,
+
     EvidenceCopyCompleted,
+
+    EvidenceCopyFailed,
 
     EvidenceRegistered,
 
@@ -74,6 +78,14 @@ struct EvidenceCopyContext {
     pub original_sha256: String,
     pub working_copy_sha256: String,
     pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CopyAttemptContext {
+    source_path: String,
+    destination_path: String,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +201,9 @@ struct AuditEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     copy_context: Option<EvidenceCopyContext>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    copy_attempt_context: Option<CopyAttemptContext>,
+
     previous_entry_hash: Option<String>,
 
     entry_hash: String,
@@ -241,6 +256,9 @@ struct AuditHashPayload<'a> {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     copy_context: Option<&'a EvidenceCopyContext>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copy_attempt_context: Option<&'a CopyAttemptContext>,
 
     previous_entry_hash: Option<&'a str>,
 
@@ -844,6 +862,8 @@ let case_signature = read_case_signature(&signature_path)?;
 
     )?;
 
+    verify_copy_lifecycle(&entries)?;
+
     verify_evidence_copies(&entries, case_directory, &mut summary)?;
 
     verify_artifact_entries(
@@ -939,6 +959,8 @@ let Some(first) = entries.first() else {
     for entry in entries {
 
         match entry.action {
+
+            AuditAction::EvidenceCopyStarted | AuditAction::EvidenceCopyFailed => {}
 
             AuditAction::EvidenceCopyCompleted => {
                 if entry.copy_context.is_none() {
@@ -1386,7 +1408,7 @@ let entry: AuditEntry = serde_json::from_str(&line).map_err(|error| {
 
         })?;
 
-        if entry.schema_version != 4 && entry.schema_version != 5 && entry.schema_version != 6 {
+        if entry.schema_version != 4 && entry.schema_version != 5 && entry.schema_version != 6 && entry.schema_version != 7 {
 
             return Err(format!(
 
@@ -1528,6 +1550,8 @@ let payload = AuditHashPayload {
 
         copy_context: entry.copy_context.as_ref(),
 
+        copy_attempt_context: entry.copy_attempt_context.as_ref(),
+
         previous_entry_hash: entry.previous_entry_hash.as_deref(),
 
     };
@@ -1622,6 +1646,73 @@ let Some(first) = entries.first() else {
 
 }
 
+fn verify_copy_lifecycle(entries: &[AuditEntry]) -> Result<(), String> {
+    let schema = entries.first().map(|e| e.schema_version).unwrap_or(0);
+    if schema < 7 { return Ok(()); }
+    let mut pending: Option<&CopyAttemptContext> = None;
+    let mut successful_copies = 0usize;
+    let mut failed_copy = false;
+    for entry in entries {
+        match entry.action {
+            AuditAction::EvidenceCopyStarted => {
+                if pending.is_some() { return Err("overlapping evidence copy attempts".into()); }
+                if entry.result != AuditResult::Started || entry.copy_context.is_some() {
+                    return Err("invalid EVIDENCE_COPY_STARTED record".into());
+                }
+                let ctx = entry.copy_attempt_context.as_ref()
+                    .ok_or("EVIDENCE_COPY_STARTED missing attempt context")?;
+                if ctx.source_path.trim().is_empty() || ctx.destination_path.trim().is_empty() || ctx.error.is_some() {
+                    return Err("invalid started-copy context".into());
+                }
+                use std::path::Component;
+                let destination = Path::new(&ctx.destination_path);
+                if destination.is_absolute()
+                    || destination.components().count() != 2
+                    || destination.components().next() != Some(Component::Normal(std::ffi::OsStr::new("evidence")))
+                    || destination.components().any(|c| !matches!(c, Component::Normal(_))) {
+                    return Err("unsafe copy-attempt destination".into());
+                }
+                pending = Some(ctx);
+                failed_copy = false;
+            }
+            AuditAction::EvidenceCopyCompleted => {
+                let started = pending.take().ok_or("EVIDENCE_COPY_COMPLETED without STARTED")?;
+                let completed = entry.copy_context.as_ref().ok_or("missing completed copy context")?;
+                if entry.result != AuditResult::Success || entry.copy_attempt_context.is_some()
+                    || started.source_path != completed.original_path
+                    || started.destination_path != completed.working_copy_path {
+                    return Err("copy completion does not match started attempt".into());
+                }
+                successful_copies += 1;
+            }
+            AuditAction::EvidenceCopyFailed => {
+                let started = pending.take().ok_or("EVIDENCE_COPY_FAILED without STARTED")?;
+                let failed = entry.copy_attempt_context.as_ref().ok_or("missing failed-copy context")?;
+                if entry.result != AuditResult::Failed || entry.copy_context.is_some()
+                    || started.source_path != failed.source_path
+                    || started.destination_path != failed.destination_path
+                    || !failed.error.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                    return Err("invalid failed-copy context".into());
+                }
+                failed_copy = true;
+            }
+            AuditAction::AnalysisStarted | AuditAction::EvidenceRegistered => {
+                if pending.is_some() || failed_copy || successful_copies == 0 {
+                    return Err("analysis/registration without a successful copy".into());
+                }
+            }
+            AuditAction::CaseClosed => {
+                if pending.is_some() { return Err("case closed with unfinished copy attempt".into()); }
+            }
+            _ => {
+                if entry.copy_attempt_context.is_some() { return Err("unexpected copy-attempt context".into()); }
+            }
+        }
+    }
+    if pending.is_some() { return Err("unterminated copy attempt".into()); }
+    Ok(())
+}
+
 fn verify_evidence_copies(
     entries: &[AuditEntry],
     case_directory: &Path,
@@ -1660,7 +1751,7 @@ fn verify_evidence_copies(
             return Err("copy event evidence hash does not match source hash".into());
         }
         let recorded = Path::new(&copy.working_copy_path);
-        let path = if schema == 6 {
+        let path = if schema >= 6 {
             use std::path::Component;
             if recorded.is_absolute()
                 || recorded.components().any(|component| !matches!(component, Component::Normal(_)))

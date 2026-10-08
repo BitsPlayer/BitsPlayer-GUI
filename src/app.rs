@@ -10,7 +10,7 @@ use crate::analyze;
 
 use crate::extract;
 
-use crate::forensic::audit::{AuditAction, AuditLogger, AuditResult, EvidenceCopyContext};
+use crate::forensic::audit::{AuditAction, AuditLogger, AuditResult, EvidenceCopyContext, CopyAttemptContext};
 
 use crate::forensic::case::Case;
 
@@ -71,6 +71,8 @@ pub struct App {
     audit: Option<AuditLogger>,
 
     case_closed: bool,
+
+    pending_copy: Option<CopyAttemptContext>,
 
 }
 
@@ -330,6 +332,8 @@ let mut analyze_state = analyze::State::default();
 
                 case_closed: false,
 
+                pending_copy: None,
+
             },
 
             open.map(|_| Message::MainOpened),
@@ -483,6 +487,61 @@ let evidence_verified = self
     }
 
     fn update_analyze(&mut self, msg: analyze::Message) -> Task<Message> {
+        if let analyze::Message::CopyRequested(source) = msg {
+            if self.analyze.busy || self.pending_copy.is_some() { return Task::none(); }
+            let destination = self.case.case_directory.join("evidence")
+                .join(format!("working-{}.mp4", uuid::Uuid::new_v4()));
+            let relative = match destination.strip_prefix(&self.case.case_directory) {
+                Ok(path) => path.to_string_lossy().into_owned(),
+                Err(_) => return Task::none(),
+            };
+            let attempt = CopyAttemptContext {
+                source_path: source.to_string_lossy().into_owned(),
+                destination_path: relative,
+                error: None,
+            };
+            let Some(logger) = self.audit.as_mut() else {
+                self.analyze.error = Some("Forensic audit logger unavailable; copying blocked".into());
+                return Task::none();
+            };
+            if let Err(err) = logger.log_copy_attempt(
+                self.case.id, AuditAction::EvidenceCopyStarted, attempt.clone()
+            ) {
+                self.analyze.error = Some(format!("Copy blocked: cannot record start: {err}"));
+                return Task::none();
+            }
+            self.pending_copy = Some(attempt);
+            return self.analyze.update(analyze::Message::CopyAuthorized { source, destination })
+                .map(Message::Analyze);
+        }
+
+        if let analyze::Message::CopyReady(Err(ref failure)) = msg {
+            let Some(mut attempt) = self.pending_copy.take() else {
+                self.analyze.error = Some("Copy failed without a recorded start".into());
+                self.analyze.busy = false;
+                return Task::none();
+            };
+            attempt.error = Some(failure.clone());
+            let result = self.audit.as_mut().ok_or_else(|| "audit logger unavailable".to_string())
+                .and_then(|logger| logger.log_copy_attempt(
+                    self.case.id, AuditAction::EvidenceCopyFailed, attempt
+                ).map(|_| ()).map_err(|err| err.to_string()));
+            let task = self.analyze.update(msg).map(Message::Analyze);
+            if let Err(err) = result {
+                self.analyze.error = Some(format!("Copy failed and audit logging failed: {err}"));
+                self.analyze.status = "Copy failure audit error".into();
+            }
+            return task;
+        }
+
+        if let analyze::Message::CopyReady(Ok(_)) = &msg {
+            if self.pending_copy.is_none() {
+                self.analyze.busy = false;
+                self.analyze.error = Some("Copy completion without audited start".into());
+                return Task::none();
+            }
+        }
+
 
 let selecting = matches!(msg, analyze::Message::MapSelect(_));
 
@@ -536,12 +595,25 @@ let Some(logger) = self.audit.as_mut() else {
                 working_copy_sha256: evidence.sha256.clone(),
                 size_bytes: size,
             };
+            let Some(attempt) = self.pending_copy.as_ref() else {
+                self.analyze.busy = false;
+                self.analyze.error = Some("Missing copy-start audit context".into());
+                return Task::none();
+            };
+            if attempt.source_path != copy_context.original_path
+                || attempt.destination_path != copy_context.working_copy_path {
+                self.analyze.busy = false;
+                self.analyze.error = Some("Copy completion does not match audited start".into());
+                return Task::none();
+            }
             if let Err(err) = logger.log_evidence_copy(self.case.id, copy_context) {
                 self.analyze.busy = false;
                 self.analyze.error = Some(format!("Evidence-copy audit failed: {err}"));
                 self.analyze.status = "Analysis blocked: copy audit failure".into();
                 return Task::none();
             }
+
+            self.pending_copy = None;
 
             if let Err(err) = logger.log_with_context(
 

@@ -67,6 +67,8 @@ pub enum Message {
 
      */
 
+    CopyRequested(PathBuf),
+    CopyAuthorized { source: PathBuf, destination: PathBuf },
     CopyReady(Result<(VerifiedCopy, EvidenceRecord), String>),
 
     EvidenceReady(
@@ -282,10 +284,13 @@ impl State {
                 let Some(source) = rfd::FileDialog::new()
                     .add_filter("MP4 video", &["mp4", "m4v", "mov"])
                     .pick_file() else { return Task::none(); };
-                let Some(dir) = self.evidence_directory.clone() else {
-                    self.error = Some("Case evidence directory is not configured".into());
-                    return Task::none();
-                };
+                Task::done(Message::CopyRequested(source))
+            }
+
+            Message::CopyRequested(_) => Task::none(),
+
+            Message::CopyAuthorized { source, destination } => {
+                if self.busy { return Task::none(); }
                 self.path = None;
                 self.original_path = Some(source.clone());
                 self.working_copy = None;
@@ -298,9 +303,10 @@ impl State {
                 self.status = format!("Preparing verified copy of {}...", display_name(&source));
                 Task::perform(async move {
                     match tokio::task::spawn_blocking(move || {
-                        std::fs::create_dir_all(&dir)
-                            .map_err(|err| format!("Cannot create evidence directory: {err}"))?;
-                        let destination = dir.join(format!("working-{}.mp4", uuid::Uuid::new_v4()));
+                        if let Some(parent) = destination.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|err| format!("Cannot create evidence directory: {err}"))?;
+                        }
                         let copy = create_verified_copy(&source, &destination)
                             .map_err(|err| format!("Evidence copy failed: {err}"))?;
                         if !verify_working_copy(&copy)
