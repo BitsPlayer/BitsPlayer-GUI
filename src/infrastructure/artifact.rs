@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::forensic::hashing::sha256_file;
+use crate::infrastructure::hashing::sha256_file;
 
 pub use crate::domain::artifact::ArtifactRecord;
 
