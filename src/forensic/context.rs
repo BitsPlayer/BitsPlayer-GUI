@@ -34,6 +34,8 @@ pub struct ExtractionParameters {
     pub include_non_idr: bool,
     pub include_partial: bool,
     pub with_audio: bool,
+    #[serde(default)]
+    pub all_frames: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,6 +83,7 @@ mod tests {
                 include_non_idr: false,
                 include_partial: true,
                 with_audio: false,
+                all_frames: true,
             },
         );
 
@@ -88,5 +91,6 @@ mod tests {
         assert_eq!(parameters.width, 1920);
         assert_eq!(parameters.height, 1080);
         assert!(parameters.include_partial);
+        assert!(parameters.all_frames);
     }
 }

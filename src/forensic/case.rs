@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    io,
+    fs::{self, OpenOptions},
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
@@ -45,15 +45,9 @@ impl Case {
     ) -> Self {
         let id = Uuid::new_v4();
 
-        let short_id = id
-            .to_string()
-            .chars()
-            .take(8)
-            .collect::<String>();
-
         let case_directory = base_directory
             .as_ref()
-            .join(format!("CASE-{short_id}"));
+            .join(format!("CASE-{id}"));
 
         Self {
             schema_version: CASE_SCHEMA_VERSION,
@@ -66,15 +60,32 @@ impl Case {
     }
 
     pub fn save(&self) -> io::Result<()> {
-        fs::create_dir_all(&self.case_directory)?;
+        if let Some(parent) = self.case_directory.parent() {
+            fs::create_dir_all(parent)?;
+        }
 
-        let json = serde_json::to_string_pretty(self)
-            .map_err(io::Error::other)?;
+        fs::create_dir(&self.case_directory).map_err(|err| {
+            if err.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "forensic case directory already exists: {}",
+                        self.case_directory.display()
+                    ),
+                )
+            } else {
+                err
+            }
+        })?;
 
-        fs::write(
-            self.case_file_path(),
-            json,
-        )
+        let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.case_file_path())?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
     }
 
     pub fn load(
@@ -207,11 +218,9 @@ mod tests {
                 .unwrap()
                 .to_string_lossy();
 
-        assert!(
-            folder_name
-                .starts_with(
-                    "CASE-",
-                )
+        assert_eq!(
+            folder_name,
+            format!("CASE-{}", case.id)
         );
     }
 

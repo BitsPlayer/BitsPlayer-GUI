@@ -304,6 +304,39 @@ impl AuditLogger {
         source_evidence_sha256: Option<String>,
         operation_context: Option<OperationContext>,
     ) -> io::Result<AuditEntry> {
+        let entry = self.build_entry(
+            case_id,
+            action,
+            result,
+            evidence_filename,
+            evidence_sha256,
+            case_metadata_sha256,
+            artifact_filename,
+            artifact_sha256,
+            artifact_type,
+            artifact_size_bytes,
+            source_evidence_sha256,
+            operation_context,
+        )?;
+        self.commit_entry(&entry)?;
+        Ok(entry)
+    }
+
+    fn build_entry(
+        &self,
+        case_id: Uuid,
+        action: AuditAction,
+        result: AuditResult,
+        evidence_filename: Option<String>,
+        evidence_sha256: Option<String>,
+        case_metadata_sha256: Option<String>,
+        artifact_filename: Option<String>,
+        artifact_sha256: Option<String>,
+        artifact_type: Option<String>,
+        artifact_size_bytes: Option<u64>,
+        source_evidence_sha256: Option<String>,
+        operation_context: Option<OperationContext>,
+    ) -> io::Result<AuditEntry> {
         let timestamp = Utc::now();
         let sequence = self.next_sequence;
         let previous_entry_hash = self.last_hash.clone();
@@ -333,7 +366,7 @@ impl AuditLogger {
             previous_entry_hash.as_deref(),
         )?;
 
-        let entry = AuditEntry {
+        Ok(AuditEntry {
             schema_version: AUDIT_SCHEMA_VERSION,
             sequence,
             timestamp,
@@ -355,18 +388,51 @@ impl AuditLogger {
             host_context: self.host_context.clone(),
             operation_context,
             previous_entry_hash,
-            entry_hash: entry_hash.clone(),
-        };
+            entry_hash,
+        })
+    }
 
-        let serialized = serde_json::to_string(&entry).map_err(io::Error::other)?;
+    fn commit_entry(&mut self, entry: &AuditEntry) -> io::Result<()> {
+        if entry.sequence != self.next_sequence || entry.previous_entry_hash != self.last_hash {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "prepared audit entry does not match the current log head",
+            ));
+        }
+
+        let serialized = serde_json::to_string(entry).map_err(io::Error::other)?;
         writeln!(self.file, "{serialized}")?;
         self.file.flush()?;
         self.file.sync_all()?;
 
-        self.last_hash = Some(entry_hash);
+        self.last_hash = Some(entry.entry_hash.clone());
         self.next_sequence = self.next_sequence.saturating_add(1);
+        Ok(())
+    }
 
-        Ok(entry)
+    pub fn prepare_case_closed(
+        &self,
+        case_id: Uuid,
+        case_metadata_sha256: Option<String>,
+    ) -> io::Result<AuditEntry> {
+        self.build_entry(
+            case_id,
+            AuditAction::CaseClosed,
+            AuditResult::Success,
+            None,
+            None,
+            case_metadata_sha256,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn commit_prepared(&mut self, entry: &AuditEntry) -> io::Result<()> {
+        self.commit_entry(entry)
     }
 
     pub fn close_case(
@@ -429,6 +495,7 @@ pub fn verify_audit_log(path: impl AsRef<Path>) -> io::Result<AuditVerification>
     let reader = BufReader::new(file);
 
     let mut expected_previous_hash: Option<String> = None;
+    let mut expected_case_id: Option<Uuid> = None;
     let mut expected_sequence = 1u64;
     let mut entries_checked = 0usize;
     let mut last_sequence = 0u64;
@@ -471,6 +538,23 @@ pub fn verify_audit_log(path: impl AsRef<Path>) -> io::Result<AuditVerification>
             });
         }
 
+        if let Some(expected) = expected_case_id {
+            if entry.case_id != expected {
+                return Ok(AuditVerification {
+                    valid: false,
+                    entries_checked,
+                    last_hash: expected_previous_hash,
+                    last_sequence,
+                    error: Some(format!(
+                        "case ID mismatch at audit line {}: expected {}, found {}",
+                        index + 1,
+                        expected,
+                        entry.case_id
+                    )),
+                });
+            }
+        }
+
         if entry.sequence != expected_sequence {
             return Ok(AuditVerification {
                 valid: false,
@@ -496,37 +580,7 @@ pub fn verify_audit_log(path: impl AsRef<Path>) -> io::Result<AuditVerification>
             });
         }
 
-        let provenance = BuildProvenance {
-            tool_version: entry.tool_version.clone(),
-            git_commit: entry.git_commit.clone(),
-            cargo_lock_sha256: entry.cargo_lock_sha256.clone(),
-            binary_sha256: entry.binary_sha256.clone(),
-        };
-
-        let fields = AuditFields {
-            evidence_filename: entry.evidence_filename.as_deref(),
-            evidence_sha256: entry.evidence_sha256.as_deref(),
-            case_metadata_sha256: entry.case_metadata_sha256.as_deref(),
-            artifact_filename: entry.artifact_filename.as_deref(),
-            artifact_sha256: entry.artifact_sha256.as_deref(),
-            artifact_type: entry.artifact_type.as_deref(),
-            artifact_size_bytes: entry.artifact_size_bytes,
-            source_evidence_sha256: entry.source_evidence_sha256.as_deref(),
-        };
-
-        let recalculated_hash = calculate_entry_hash(
-            entry.schema_version,
-            entry.sequence,
-            &entry.timestamp,
-            entry.case_id,
-            &entry.action,
-            &entry.result,
-            &provenance,
-            &fields,
-            &entry.host_context,
-            entry.operation_context.as_ref(),
-            entry.previous_entry_hash.as_deref(),
-        )?;
+        let recalculated_hash = hash_of_entry(&entry)?;
 
         if recalculated_hash != entry.entry_hash {
             return Ok(AuditVerification {
@@ -542,6 +596,7 @@ pub fn verify_audit_log(path: impl AsRef<Path>) -> io::Result<AuditVerification>
         }
 
         expected_previous_hash = Some(entry.entry_hash.clone());
+        expected_case_id = Some(entry.case_id);
         last_sequence = entry.sequence;
         expected_sequence = expected_sequence.saturating_add(1);
         entries_checked += 1;
@@ -554,6 +609,121 @@ pub fn verify_audit_log(path: impl AsRef<Path>) -> io::Result<AuditVerification>
         last_sequence,
         error: None,
     })
+}
+
+pub fn read_verified_audit(
+    path: impl AsRef<Path>,
+    expected_case_id: Uuid,
+) -> Result<Vec<AuditEntry>, String> {
+    let path = path.as_ref();
+    let file = File::open(path).map_err(|error| {
+        format!("failed to open {}: {error}", path.display())
+    })?;
+    let reader = BufReader::new(file);
+
+    let mut entries = Vec::new();
+    let mut expected_previous_hash: Option<String> = None;
+    let mut expected_sequence = 1u64;
+
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.map_err(|error| {
+            format!("failed reading audit line {}: {error}", index + 1)
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let entry: AuditEntry = serde_json::from_str(&line).map_err(|error| {
+            format!("invalid audit JSON at line {}: {error}", index + 1)
+        })?;
+
+        if entry.schema_version != AUDIT_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported audit schema at line {}: expected {}, found {}",
+                index + 1,
+                AUDIT_SCHEMA_VERSION,
+                entry.schema_version
+            ));
+        }
+
+        if entry.case_id != expected_case_id {
+            return Err(format!(
+                "case ID mismatch at audit line {}: expected {}, found {}",
+                index + 1,
+                expected_case_id,
+                entry.case_id
+            ));
+        }
+
+        if entry.sequence != expected_sequence {
+            return Err(format!(
+                "audit sequence mismatch at line {}: expected {}, found {}",
+                index + 1,
+                expected_sequence,
+                entry.sequence
+            ));
+        }
+
+        if entry.previous_entry_hash != expected_previous_hash {
+            return Err(format!(
+                "audit previous-entry hash mismatch at line {}",
+                index + 1
+            ));
+        }
+
+        let calculated_hash = hash_of_entry(&entry)
+            .map_err(|error| format!("failed to hash audit entry at line {}: {error}", index + 1))?;
+        if calculated_hash != entry.entry_hash {
+            return Err(format!(
+                "audit entry hash mismatch at line {}: stored={}, calculated={}",
+                index + 1,
+                entry.entry_hash,
+                calculated_hash
+            ));
+        }
+
+        expected_previous_hash = Some(entry.entry_hash.clone());
+        expected_sequence = expected_sequence.saturating_add(1);
+        entries.push(entry);
+    }
+
+    if entries.is_empty() {
+        return Err(String::from("audit log contains no entries"));
+    }
+
+    Ok(entries)
+}
+
+fn hash_of_entry(entry: &AuditEntry) -> io::Result<String> {
+    let provenance = BuildProvenance {
+        tool_version: entry.tool_version.clone(),
+        git_commit: entry.git_commit.clone(),
+        cargo_lock_sha256: entry.cargo_lock_sha256.clone(),
+        binary_sha256: entry.binary_sha256.clone(),
+    };
+    let fields = AuditFields {
+        evidence_filename: entry.evidence_filename.as_deref(),
+        evidence_sha256: entry.evidence_sha256.as_deref(),
+        case_metadata_sha256: entry.case_metadata_sha256.as_deref(),
+        artifact_filename: entry.artifact_filename.as_deref(),
+        artifact_sha256: entry.artifact_sha256.as_deref(),
+        artifact_type: entry.artifact_type.as_deref(),
+        artifact_size_bytes: entry.artifact_size_bytes,
+        source_evidence_sha256: entry.source_evidence_sha256.as_deref(),
+    };
+    calculate_entry_hash(
+        entry.schema_version,
+        entry.sequence,
+        &entry.timestamp,
+        entry.case_id,
+        &entry.action,
+        &entry.result,
+        &provenance,
+        &fields,
+        &entry.host_context,
+        entry.operation_context.as_ref(),
+        entry.previous_entry_hash.as_deref(),
+    )
 }
 
 fn calculate_entry_hash(

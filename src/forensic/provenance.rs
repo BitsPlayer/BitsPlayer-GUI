@@ -40,7 +40,7 @@ impl BuildProvenance {
                 &executable,
             )?;
 
-        Ok(Self {
+        let provenance = Self {
             tool_version:
                 env!(
                     "CARGO_PKG_VERSION"
@@ -60,7 +60,20 @@ impl BuildProvenance {
                 .to_string(),
 
             binary_sha256,
-        })
+        };
+
+        if provenance.git_commit.is_empty()
+            || provenance.git_commit == "UNKNOWN"
+            || provenance.cargo_lock_sha256 == "UNKNOWN"
+            || provenance.cargo_lock_sha256.len() != 64
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "build provenance is incomplete; refusing to open a forensic case",
+            ));
+        }
+
+        Ok(provenance)
     }
 
     pub fn executable_path(

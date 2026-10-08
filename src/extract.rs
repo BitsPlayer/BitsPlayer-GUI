@@ -98,6 +98,8 @@ pub enum Message {
 
     ToggleAudio(bool),
 
+    ToggleAllFrames(bool),
+
     Run,
 
     Tick,
@@ -108,6 +110,13 @@ pub enum Message {
 
     Save,
 
+}
+
+#[derive(Debug, Clone)]
+pub enum SaveOutcome {
+    Cancelled,
+    Wrote(Vec<ArtifactRecord>),
+    Failed(Vec<ArtifactRecord>),
 }
 
 struct Progress {
@@ -226,6 +235,8 @@ pub struct State {
 
     pub with_audio: bool,
 
+    pub all_frames: bool,
+
     pub running: bool,
 
     pub error: Option<String>,
@@ -241,6 +252,8 @@ pub struct State {
     pub source_evidence_sha256: Option<String>,
 
     pub artifacts: Vec<ArtifactRecord>,
+
+    last_save: Option<SaveOutcome>,
 
     }
 
@@ -263,6 +276,8 @@ impl Default for State {
             include_partial: false,
 
             with_audio: false,
+
+            all_frames: false,
 
             running: false,
 
@@ -292,6 +307,8 @@ impl Default for State {
 
             artifacts: Vec::new(),
 
+            last_save: None,
+
                     }
 
     }
@@ -320,6 +337,7 @@ impl State {
             include_non_idr: self.include_non_idr,
             include_partial: self.include_partial,
             with_audio: self.with_audio,
+            all_frames: self.all_frames,
         })
     }
 
@@ -406,6 +424,7 @@ impl State {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        self.last_save = None;
 
         match message {
 
@@ -454,48 +473,63 @@ let picked = rfd::FileDialog::new()
             }
 
             Message::Width(v) => {
-
-                self.width = v;
+                if !self.running {
+                    self.width = v;
+                }
 
                 Task::none()
 
             }
 
             Message::Height(v) => {
-
-                self.height = v;
+                if !self.running {
+                    self.height = v;
+                }
 
                 Task::none()
 
             }
 
             Message::Matrix(m) => {
-
-                self.matrix = m;
+                if !self.running {
+                    self.matrix = m;
+                }
 
                 Task::none()
 
             }
 
             Message::ToggleNonIdr(v) => {
-
-                self.include_non_idr = v;
+                if !self.running {
+                    self.include_non_idr = v;
+                }
 
                 Task::none()
 
             }
 
             Message::TogglePartial(v) => {
-
-                self.include_partial = v;
+                if !self.running {
+                    self.include_partial = v;
+                }
 
                 Task::none()
 
             }
 
             Message::ToggleAudio(v) => {
+                if !self.running {
+                    self.with_audio = v;
+                }
 
-                self.with_audio = v;
+                Task::none()
+
+            }
+
+            Message::ToggleAllFrames(v) => {
+                if !self.running {
+                    self.all_frames = v;
+                }
 
                 Task::none()
 
@@ -582,8 +616,7 @@ let pct = if g.total > 0 {
             }
 
             Message::Save => {
-
-                self.save_frames();
+                self.last_save = Some(self.save_frames());
 
                 Task::none()
 
@@ -694,6 +727,8 @@ let opts = Options {
 
             with_audio: self.with_audio,
 
+            all_frames: self.all_frames,
+
         };
 
 let matrix = self.matrix.to_matrix();
@@ -722,26 +757,26 @@ let outcome = run_extract(&path, opts, matrix, &mut reporter);
 
     }
 
-    fn save_frames(&mut self) {
+    fn save_frames(&mut self) -> SaveOutcome {
         let Some(source_evidence_sha256) = self.source_evidence_sha256.clone() else {
             self.error = Some(String::from(
                 "Cannot save forensic artifacts: source evidence is not verified",
             ));
-            return;
+            return SaveOutcome::Failed(Vec::new());
         };
 
         let Some(result) = &self.result else {
             self.error = Some(String::from("Nothing to save yet"));
-            return;
+            return SaveOutcome::Failed(Vec::new());
         };
 
         let Some(dir) = rfd::FileDialog::new().pick_folder() else {
-            return;
+            return SaveOutcome::Cancelled;
         };
 
         if let Err(err) = std::fs::create_dir_all(&dir) {
             self.error = Some(err.to_string());
-            return;
+            return SaveOutcome::Failed(Vec::new());
         }
 
         let mut new_artifacts = Vec::new();
@@ -764,7 +799,7 @@ let outcome = run_extract(&path, opts, matrix, &mut reporter);
             ) {
                 Ok(artifact) => artifact,
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    self.artifacts = new_artifacts;
+                    self.artifacts = new_artifacts.clone();
                     self.error = Some(format!(
                         "Refusing to overwrite existing forensic artifact: {}",
                         path.display()
@@ -772,16 +807,16 @@ let outcome = run_extract(&path, opts, matrix, &mut reporter);
                     self.status = String::from(
                         "Artifact export stopped: existing file detected",
                     );
-                    return;
+                    return SaveOutcome::Failed(new_artifacts);
                 }
                 Err(err) => {
-                    self.artifacts = new_artifacts;
+                    self.artifacts = new_artifacts.clone();
                     self.error = Some(format!(
                         "Writing forensic artifact {} failed: {err}",
                         path.display()
                     ));
                     self.status = String::from("Artifact export failed");
-                    return;
+                    return SaveOutcome::Failed(new_artifacts);
                 }
             };
 
@@ -789,16 +824,17 @@ let outcome = run_extract(&path, opts, matrix, &mut reporter);
         }
 
         let count = new_artifacts.len();
-        self.artifacts = new_artifacts;
+        self.artifacts = new_artifacts.clone();
         self.error = None;
         self.status = format!(
             "{count} forensic artifacts saved and SHA-256 hashed in {}",
             dir.display()
         );
+        SaveOutcome::Wrote(new_artifacts)
     }
 
-    pub fn artifacts(&self) -> &[ArtifactRecord] {
-        &self.artifacts
+    pub fn take_last_save(&mut self) -> Option<SaveOutcome> {
+        self.last_save.take()
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -893,13 +929,35 @@ let open = button(
 
         .padding([10, 14]);
 
+let matrix_control: Element<'_, Message> = if self.running {
+
+            text(self.matrix.to_string())
+
+                .size(14)
+
+                .color(theme::MUTED)
+
+                .into()
+
+        } else {
+
+            pick_list(MatrixChoice::ALL, Some(self.matrix), Message::Matrix)
+
+                .padding(8)
+
+                .width(110)
+
+                .into()
+
+        };
+
 let size_row = row![
 
             text("Size").size(13).color(theme::MUTED),
 
             text_input("width", &self.width)
 
-                .on_input(Message::Width)
+                .on_input_maybe((!self.running).then_some(Message::Width))
 
                 .style(theme::field)
 
@@ -911,7 +969,7 @@ let size_row = row![
 
             text_input("height", &self.height)
 
-                .on_input(Message::Height)
+                .on_input_maybe((!self.running).then_some(Message::Height))
 
                 .style(theme::field)
 
@@ -919,11 +977,7 @@ let size_row = row![
 
                 .padding(8),
 
-            pick_list(MatrixChoice::ALL, Some(self.matrix), Message::Matrix,)
-
-                .padding(8)
-
-                .width(110),
+            matrix_control,
 
         ]
 
@@ -935,7 +989,7 @@ let flags = row![
 
             checkbox("Include non-IDR", self.include_non_idr)
 
-                .on_toggle(Message::ToggleNonIdr)
+                .on_toggle_maybe((!self.running).then_some(Message::ToggleNonIdr))
 
                 .size(16)
 
@@ -943,7 +997,7 @@ let flags = row![
 
             checkbox("Include partial", self.include_partial)
 
-                .on_toggle(Message::TogglePartial)
+                .on_toggle_maybe((!self.running).then_some(Message::TogglePartial))
 
                 .size(16)
 
@@ -951,7 +1005,15 @@ let flags = row![
 
             checkbox("With audio", self.with_audio)
 
-                .on_toggle(Message::ToggleAudio)
+                .on_toggle_maybe((!self.running).then_some(Message::ToggleAudio))
+
+                .size(16)
+
+                .text_size(13),
+
+            checkbox("All frames", self.all_frames)
+
+                .on_toggle_maybe((!self.running).then_some(Message::ToggleAllFrames))
 
                 .size(16)
 

@@ -13,23 +13,15 @@ fn main() {
 
     configure_git_rerun_tracking();
 
-    let git_commit =
-        git_commit()
-            .unwrap_or_else(|| {
-                String::from("UNKNOWN")
-            });
+    let git_commit = git_commit().unwrap_or_else(|| {
+        panic!(
+            "forensic provenance requires git rev-parse HEAD; refusing to build with an unknown commit"
+        );
+    });
 
-    let cargo_lock_sha256 =
-        sha256_file(
-            Path::new("Cargo.lock"),
-        )
-        .unwrap_or_else(|err| {
-            println!(
-                "cargo:warning=Failed to hash Cargo.lock: {err}"
-            );
-
-            String::from("UNKNOWN")
-        });
+    let cargo_lock_sha256 = sha256_file(Path::new("Cargo.lock")).unwrap_or_else(|err| {
+        panic!("forensic provenance requires a Cargo.lock SHA-256: {err}");
+    });
 
     println!(
         "cargo:rustc-env=BITPLAYER_GIT_COMMIT={git_commit}"

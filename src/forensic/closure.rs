@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    io,
+    fs::{self, OpenOptions},
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
@@ -44,10 +44,14 @@ impl CaseClosure {
             .as_ref()
             .join("case_closure.json");
 
-        let json = serde_json::to_string_pretty(self)
-            .map_err(io::Error::other)?;
+        let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
 
-        fs::write(&path, json)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
 
         Ok(path)
     }

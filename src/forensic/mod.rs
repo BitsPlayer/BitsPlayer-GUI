@@ -6,4 +6,6 @@ pub mod context;
 pub mod evidence;
 pub mod hashing;
 pub mod provenance;
+pub mod seal;
 pub mod signing;
+pub mod verify;
