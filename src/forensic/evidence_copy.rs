@@ -69,12 +69,16 @@ pub fn create_verified_copy(source: &Path, destination: &Path) -> io::Result<Ver
         if expected != actual {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "working-copy SHA-256 mismatch"));
         }
-        Ok(VerifiedCopy {
+        let copy = VerifiedCopy {
             source_path: source.to_path_buf(),
             copy_path: destination.to_path_buf(),
             size_bytes: count,
             sha256: expected,
-        })
+        };
+
+        protect_working_copy(&copy)?;
+
+        Ok(copy)
     })();
 
     if result.is_err() {
@@ -90,23 +94,161 @@ pub fn verify_working_copy(copy: &VerifiedCopy) -> io::Result<bool> {
     Ok(sha256_file(&copy.copy_path)? == copy.sha256)
 }
 
+/// Restrict a verified working copy to owner-read access.
+///
+/// Unix permissions are not an immutable-storage guarantee.
+pub fn protect_working_copy(
+    copy: &VerifiedCopy,
+) -> io::Result<()> {
+    if !verify_working_copy(copy)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Cannot protect working copy: SHA-256 verification failed",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let permissions = fs::Permissions::from_mode(0o400);
+
+        fs::set_permissions(
+            &copy.copy_path,
+            permissions,
+        )?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut permissions =
+            fs::metadata(&copy.copy_path)?.permissions();
+
+        permissions.set_readonly(true);
+
+        fs::set_permissions(
+            &copy.copy_path,
+            permissions,
+        )?;
+    }
+
+    if !verify_working_copy(copy)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Working-copy verification failed after protection",
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn copies_and_verifies_without_overwriting() {
-        let dir = std::env::temp_dir().join(format!("bitsplayer_copy_test_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(
+            format!(
+                "bitsplayer_copy_test_{}",
+                uuid::Uuid::new_v4()
+            )
+        );
+
         fs::create_dir(&dir).unwrap();
+
         let source = dir.join("source.mp4");
         let target = dir.join("working.mp4");
-        fs::write(&source, b"test evidence bytes").unwrap();
-        let copy = create_verified_copy(&source, &target).unwrap();
-        assert!(verify_working_copy(&copy).unwrap());
-        assert_eq!(copy.sha256, sha256_file(&source).unwrap());
-        assert!(create_verified_copy(&source, &target).is_err());
-        fs::write(&target, b"changed evidence").unwrap();
-        assert!(!verify_working_copy(&copy).unwrap());
+
+        // Create original test evidence.
+        fs::write(
+            &source,
+            b"test evidence bytes",
+        )
+        .unwrap();
+
+        // Create verified working copy.
+        let copy = create_verified_copy(
+            &source,
+            &target,
+        )
+        .unwrap();
+
+        // Verify copy integrity.
+        assert!(
+            verify_working_copy(&copy).unwrap()
+        );
+
+        // Original and working-copy hashes must match.
+        assert_eq!(
+            copy.sha256,
+            sha256_file(&source).unwrap()
+        );
+
+        // Existing working copies must not be overwritten.
+        assert!(
+            create_verified_copy(
+                &source,
+                &target,
+            )
+            .is_err()
+        );
+
+        // Verify read-only permissions.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let metadata = fs::metadata(&target).unwrap();
+
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o400
+            );
+        }
+
+        // Restore write permission only for the
+        // controlled tampering test.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(
+                &target,
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut permissions =
+                fs::metadata(&target)
+                    .unwrap()
+                    .permissions();
+
+            permissions.set_readonly(false);
+
+            fs::set_permissions(
+                &target,
+                permissions,
+            )
+            .unwrap();
+        }
+
+        // Simulate unauthorized modification.
+        fs::write(
+            &target,
+            b"changed evidence",
+        )
+        .unwrap();
+
+        // Integrity verification must detect modification.
+        assert!(
+            !verify_working_copy(&copy).unwrap()
+        );
+
+        // Clean up temporary test files.
         fs::remove_dir_all(dir).unwrap();
     }
 
