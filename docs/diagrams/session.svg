@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 640" role="img">
+  <title>Examiner session</title>
+  <desc>From opening BitsPlayer, through analysis, extraction, and the custody tab, to sealing the case and checking it later.</desc>
+  <rect width="960" height="640" fill="#f4f1ea"/>
+  <text x="40" y="44" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="20" font-weight="650">One examination</text>
+  <text x="40" y="68" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Each launch starts a new case. The source MP4 is only read.</text>
+
+  <line x1="78" y1="108" x2="78" y2="548" stroke="#d9d3c7" stroke-width="2"/>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <circle cx="78" cy="124" r="14" fill="#3d6b7a"/>
+    <text x="78" y="129" text-anchor="middle" fill="#fffcf7" font-size="12" font-weight="650">1</text>
+    <rect x="112" y="96" width="390" height="72" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+    <text x="132" y="126" fill="#1c1915" font-size="15" font-weight="650">Open BitsPlayer</text>
+    <text x="132" y="148" fill="#6b645c" font-size="13">Creates cases/CASE-&lt;uuid&gt; and writes CASE_CREATED.</text>
+
+    <circle cx="78" cy="228" r="14" fill="#3d6b7a"/>
+    <text x="78" y="233" text-anchor="middle" fill="#fffcf7" font-size="12" font-weight="650">2</text>
+    <rect x="112" y="196" width="390" height="88" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+    <text x="132" y="226" fill="#1c1915" font-size="15" font-weight="650">Analyze</text>
+    <text x="132" y="248" fill="#6b645c" font-size="13">Hash the MP4, read its layout, hash it again.</text>
+    <text x="132" y="266" fill="#6b645c" font-size="13">The sidebar shows whether those hashes match.</text>
+
+    <circle cx="78" cy="348" r="14" fill="#3d6b7a"/>
+    <text x="78" y="353" text-anchor="middle" fill="#fffcf7" font-size="12" font-weight="650">3</text>
+    <rect x="112" y="308" width="390" height="88" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+    <text x="132" y="338" fill="#1c1915" font-size="15" font-weight="650">Extract</text>
+    <text x="132" y="360" fill="#6b645c" font-size="13">Runs after the evidence hash is verified.</text>
+    <text x="132" y="378" fill="#6b645c" font-size="13">Save PNGs to a folder you choose.</text>
+
+    <circle cx="78" cy="456" r="14" fill="#3d6b7a"/>
+    <text x="78" y="461" text-anchor="middle" fill="#fffcf7" font-size="12" font-weight="650">4</text>
+    <rect x="112" y="420" width="390" height="72" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+    <text x="132" y="450" fill="#1c1915" font-size="15" font-weight="650">Custody</text>
+    <text x="132" y="472" fill="#6b645c" font-size="13">Open any time. It only displays the chain.</text>
+
+    <circle cx="78" cy="564" r="14" fill="#8a5a12"/>
+    <text x="78" y="569" text-anchor="middle" fill="#fffcf7" font-size="12" font-weight="650">5</text>
+    <rect x="112" y="516" width="390" height="88" rx="10" fill="#fffcf7" stroke="#e4d3b0"/>
+    <text x="132" y="546" fill="#1c1915" font-size="15" font-weight="650">Close the window</text>
+    <text x="132" y="568" fill="#6b645c" font-size="13">Seals and signs the case, then shows the checklist.</text>
+    <text x="132" y="586" fill="#6b645c" font-size="13">Exit after you have read it.</text>
+  </g>
+
+  <rect x="540" y="96" width="380" height="188" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+  <text x="564" y="128" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">While the case is open</text>
+  <text x="564" y="160" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Analyze shows the file map, metadata, and hex.</text>
+  <text x="564" y="182" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">A truncated file with no moov can go to Extract</text>
+  <text x="564" y="202" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">from that view once integrity is verified.</text>
+  <text x="564" y="232" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Custody lists every entry committed so far,</text>
+  <text x="564" y="252" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">including extraction settings and artifact hashes.</text>
+
+  <rect x="540" y="308" width="380" height="296" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+  <text x="564" y="340" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">After you leave</text>
+  <text x="564" y="372" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">The sealed directory can be checked again</text>
+  <text x="564" y="392" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">without opening the GUI:</text>
+  <text x="564" y="428" fill="#1c1915" font-family="ui-monospace, ui-monospace, monospace" font-size="12">bitsplayer-verify CASE_DIR</text>
+  <text x="564" y="460" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Pass --artifact-dir for the PNG folder, and</text>
+  <text x="564" y="480" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">--public-key when the trusted key is not the</text>
+  <text x="564" y="500" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">one under ~/.config/bitsplayer/signing/.</text>
+  <text x="564" y="536" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">The seal review in the GUI runs that same</text>
+  <text x="564" y="556" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">check before you exit.</text>
+</svg>

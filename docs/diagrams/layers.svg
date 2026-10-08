@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 620" role="img">
+  <title>Software layers</title>
+  <desc>Presentation calls the forensic facade. Application use cases depend on domain types and on ports implemented by infrastructure. MP4 work is done by the vendored crates.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#3d6b7a"/>
+    </marker>
+  </defs>
+  <rect width="960" height="620" fill="#f4f1ea"/>
+  <text x="40" y="42" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="20" font-weight="650">Layers</text>
+  <text x="40" y="66" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Domain types never touch the disk. Infrastructure does.</text>
+
+  <rect x="40" y="92" width="880" height="108" rx="12" fill="#fffcf7" stroke="#d9d3c7"/>
+  <text x="60" y="118" fill="#3d6b7a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="650">PRESENTATION</text>
+  <text x="60" y="146" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">bitsplayer</text>
+  <text x="60" y="168" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Iced windows: Analyze, Extract, Custody, seal review</text>
+  <text x="500" y="146" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">bitsplayer-verify</text>
+  <text x="500" y="168" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Command-line check of a sealed case</text>
+
+  <line x1="480" y1="200" x2="480" y2="228" stroke="#3d6b7a" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="492" y="220" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">forensic facade</text>
+
+  <rect x="40" y="228" width="880" height="108" rx="12" fill="#fffcf7" stroke="#d9d3c7"/>
+  <text x="60" y="254" fill="#3d6b7a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="650">APPLICATION</text>
+  <text x="60" y="282" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">seal_case</text>
+  <text x="60" y="304" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Closing entry, closure file, signature</text>
+  <text x="330" y="282" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">verify_case</text>
+  <text x="330" y="304" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Checklist for a sealed directory</text>
+  <text x="620" y="282" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">ports</text>
+  <text x="620" y="304" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Audit log, signer, hasher, MP4 engines</text>
+
+  <line x1="250" y1="336" x2="250" y2="368" stroke="#3d6b7a" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="710" y1="336" x2="710" y2="368" stroke="#3d6b7a" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="40" y="368" width="430" height="128" rx="12" fill="#fffcf7" stroke="#d9d3c7"/>
+  <text x="60" y="396" fill="#3d6b7a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="650">DOMAIN</text>
+  <text x="60" y="426" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">Entities and hash math</text>
+  <text x="60" y="450" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Case, evidence, audit entry, artifact,</text>
+  <text x="60" y="470" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">closure, signature, chain hash</text>
+
+  <rect x="490" y="368" width="430" height="128" rx="12" fill="#fffcf7" stroke="#d9d3c7"/>
+  <text x="510" y="396" fill="#3d6b7a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="650">INFRASTRUCTURE</text>
+  <text x="510" y="426" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">Files, keys, and the log</text>
+  <text x="510" y="450" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Streaming SHA-256, JSONL audit, Ed25519</text>
+  <text x="510" y="470" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">identity, case and artifact storage</text>
+
+  <rect x="40" y="516" width="880" height="76" rx="12" fill="#eef3f4" stroke="#c5d4d8"/>
+  <text x="60" y="546" fill="#3d6b7a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="650">VENDORED ENGINES</text>
+  <text x="220" y="546" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="650">BitPlay</text>
+  <text x="290" y="546" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">MP4 layout and metadata</text>
+  <text x="560" y="546" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="650">iframe-extract</text>
+  <text x="680" y="546" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">H.264 frames from mdat</text>
+  <text x="220" y="570" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Called around the audit entries. They do not write the case log.</text>
+</svg>
