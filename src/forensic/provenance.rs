@@ -1,33 +1,8 @@
-use serde::{
-    Deserialize,
-    Serialize,
-};
-
-use std::{
-    io,
-    path::PathBuf,
-};
+use std::{io, path::PathBuf};
 
 use crate::forensic::hashing::sha256_file;
 
-#[derive(
-    Debug,
-    Clone,
-    Serialize,
-    Deserialize,
-    PartialEq,
-    Eq,
-)]
-#[serde(deny_unknown_fields)]
-pub struct BuildProvenance {
-    pub tool_version: String,
-
-    pub git_commit: String,
-
-    pub cargo_lock_sha256: String,
-
-    pub binary_sha256: String,
-}
+pub use crate::domain::provenance::BuildProvenance;
 
 impl BuildProvenance {
     pub fn collect(

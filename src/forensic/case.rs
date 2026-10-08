@@ -1,64 +1,14 @@
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
 };
-use uuid::Uuid;
 
 use crate::forensic::hashing::sha256_file;
 
-pub const CASE_SCHEMA_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Case {
-    pub schema_version: u32,
-    pub id: Uuid,
-    pub name: String,
-    pub created_at: DateTime<Utc>,
-    pub examiner: Option<String>,
-    pub case_directory: PathBuf,
-}
+pub use crate::domain::case::{Case, CASE_SCHEMA_VERSION};
 
 impl Case {
-    pub fn new(
-        name: impl Into<String>,
-        examiner: Option<String>,
-        case_directory: PathBuf,
-    ) -> Self {
-        Self {
-            schema_version: CASE_SCHEMA_VERSION,
-            id: Uuid::new_v4(),
-            name: name.into(),
-            created_at: Utc::now(),
-            examiner,
-            case_directory,
-        }
-    }
-
-    pub fn new_in_base(
-        name: impl Into<String>,
-        examiner: Option<String>,
-        base_directory: impl AsRef<Path>,
-    ) -> Self {
-        let id = Uuid::new_v4();
-
-        let case_directory = base_directory
-            .as_ref()
-            .join(format!("CASE-{id}"));
-
-        Self {
-            schema_version: CASE_SCHEMA_VERSION,
-            id,
-            name: name.into(),
-            created_at: Utc::now(),
-            examiner,
-            case_directory,
-        }
-    }
-
     pub fn save(&self) -> io::Result<()> {
         if let Some(parent) = self.case_directory.parent() {
             fs::create_dir_all(parent)?;
@@ -115,13 +65,6 @@ impl Case {
         Ok(case)
     }
 
-    pub fn case_file_path(
-        &self,
-    ) -> PathBuf {
-        self.case_directory
-            .join("case.json")
-    }
-
     pub fn metadata_sha256(
         &self,
     ) -> io::Result<String> {
@@ -129,6 +72,7 @@ impl Case {
             &self.case_file_path(),
         )
     }
+
 }
 
 #[cfg(test)]
