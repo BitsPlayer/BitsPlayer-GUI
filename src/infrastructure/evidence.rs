@@ -1,7 +1,7 @@
 use std::{
     fs,
     io,
-    path::{Path, PathBuf},
+    path::Path,
     time::SystemTime,
 };
 
@@ -210,6 +210,7 @@ impl EvidenceRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     use std::{
         fs,

@@ -1,5 +1,6 @@
 //! Infrastructure layer: filesystem, hashing, signing keys, and host collection.
 
+pub mod adapters;
 pub mod artifact;
 pub mod audit;
 pub mod case;

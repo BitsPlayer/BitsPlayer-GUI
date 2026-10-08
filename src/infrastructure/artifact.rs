@@ -2,7 +2,7 @@ use chrono::Utc;
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use crate::infrastructure::hashing::sha256_file;
@@ -111,6 +111,7 @@ pub fn verify_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     use std::time::{
         SystemTime,

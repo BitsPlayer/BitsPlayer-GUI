@@ -1,7 +1,7 @@
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use crate::infrastructure::hashing::sha256_file;
@@ -78,6 +78,7 @@ impl Case {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::{
         SystemTime,
         UNIX_EPOCH,

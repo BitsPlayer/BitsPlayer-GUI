@@ -1,10 +1,12 @@
 use std::path::{Component, Path, PathBuf};
 
-use crate::forensic::audit::{read_verified_audit, AuditAction, AuditEntry};
-use crate::forensic::case::{Case, CASE_SCHEMA_VERSION};
-use crate::forensic::closure::{CaseClosure, CLOSURE_SCHEMA_VERSION};
-use crate::forensic::hashing::sha256_file;
-use crate::forensic::signing::{load_verifying_key, CaseSignature, SIGNATURE_SCHEMA_VERSION};
+use crate::domain::audit::{AuditAction, AuditEntry};
+use crate::domain::case::{Case, CASE_SCHEMA_VERSION};
+use crate::domain::closure::{CaseClosure, CLOSURE_SCHEMA_VERSION};
+use crate::domain::signing::{CaseSignature, SIGNATURE_SCHEMA_VERSION};
+use crate::infrastructure::audit::read_verified_audit;
+use crate::infrastructure::hashing::sha256_file;
+use crate::infrastructure::signing::load_verifying_key;
 
 #[derive(Debug, Clone, Default)]
 pub struct VerificationReport {
@@ -560,11 +562,12 @@ fn verify_artifact_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::forensic::artifact::ArtifactRecord;
-    use crate::forensic::audit::{AuditAction, AuditLogger, AuditResult};
-    use crate::forensic::context::HostContext;
-    use crate::forensic::seal::seal_case_with_identity;
-    use crate::forensic::signing::SigningIdentity;
+    use crate::application::seal::seal_case_with_identity;
+    use crate::domain::artifact::ArtifactRecord;
+    use crate::domain::audit::{AuditAction, AuditResult};
+    use crate::domain::context::HostContext;
+    use crate::infrastructure::audit::AuditLogger;
+    use crate::infrastructure::signing::SigningIdentity;
     use chrono::Utc;
     use std::{
         fs,
