@@ -30,6 +30,7 @@ use crate::forensic::artifact::{
 
 use crate::forensic::context::ExtractionParameters;
 
+use crate::forensic::hashing::sha256_file;
 use crate::theme;
 
 use crate::widgets::frame_grid::{self, Thumb};
@@ -301,62 +302,110 @@ impl Default for State {
 impl State {
 
     pub fn forensic_parameters(&self) -> Result<ExtractionParameters, String> {
-        let width = self
+
+let width = self
+
             .width
+
             .trim()
+
             .parse::<u32>()
+
             .map_err(|_| String::from("Invalid extraction width"))?;
 
-        let height = self
+let height = self
+
             .height
+
             .trim()
+
             .parse::<u32>()
+
             .map_err(|_| String::from("Invalid extraction height"))?;
 
         Ok(ExtractionParameters {
+
             width,
+
             height,
+
             matrix: self.matrix.to_string(),
+
             include_non_idr: self.include_non_idr,
+
             include_partial: self.include_partial,
+
             with_audio: self.with_audio,
+
         })
+
     }
 
     pub fn validate_forensic_run(&self) -> Result<(), String> {
+
         if self.running {
+
             return Err(String::from("Extraction is already running"));
+
         }
 
         if self.path.is_none() {
+
             return Err(String::from("Choose an MP4 file first"));
+
         }
 
         if self.source_evidence_sha256.is_none() {
+
             return Err(String::from(
+
                 "Evidence is not verified. Analyze and verify the MP4 before forensic extraction.",
+
             ));
+
         }
 
         match self.width.trim().parse::<u32>() {
+
             Ok(w) if w > 0 => {}
+
             _ => {
+
                 return Err(String::from(
+
                     "Enter a valid width — required when SPS is lost",
+
                 ));
+
             }
+
         }
 
         match self.height.trim().parse::<u32>() {
+
             Ok(h) if h > 0 => {}
+
             _ => {
+
                 return Err(String::from(
+
                     "Enter a valid height — required when SPS is lost",
+
                 ));
+
             }
+
+        }
+
+        let path = self.path.as_ref().ok_or("Missing evidence path")?;
+        let expected = self.source_evidence_sha256.as_ref().ok_or("Missing verified SHA-256")?;
+        let actual = sha256_file(path).map_err(|err| format!("Cannot rehash working copy: {err}"))?;
+        if &actual != expected {
+            return Err("CRITICAL: working-copy SHA-256 mismatch; extraction blocked".into());
         }
 
         Ok(())
+
     }
 
     pub fn set_verified_evidence(
@@ -594,13 +643,18 @@ let pct = if g.total > 0 {
     }
 
     fn start_extract(&mut self) -> Task<Message> {
+
         if let Err(err) = self.validate_forensic_run() {
+
             self.error = Some(err.clone());
+
             self.status = err;
+
             return Task::none();
+
         }
 
-        let Some(path) = self.path.clone() else {
+let Some(path) = self.path.clone() else {
 
             self.error = Some(String::from("Choose an MP4 file first"));
 
@@ -608,10 +662,12 @@ let pct = if g.total > 0 {
 
         };
 
-        let Some(_source_evidence_sha256) = self.source_evidence_sha256.clone() else {
+let Some(_source_evidence_sha256) = self.source_evidence_sha256.clone() else {
 
             self.error = Some(String::from(
+
                 "Evidence is not verified. Analyze and verify the MP4 before forensic extraction.",
+
             ));
 
             self.status = String::from("Extraction blocked: unverified evidence");
@@ -708,7 +764,7 @@ let mut reporter = ChannelReporter {
 
             };
 
-let outcome = run_extract(&path, opts, matrix, &mut reporter);
+let outcome = run_extract(&path, opts, matrix, &mut reporter, _source_evidence_sha256);
 
             if let Ok(mut g) = progress.lock() {
 
@@ -723,82 +779,139 @@ let outcome = run_extract(&path, opts, matrix, &mut reporter);
     }
 
     fn save_frames(&mut self) {
-        let Some(source_evidence_sha256) = self.source_evidence_sha256.clone() else {
+
+let Some(source_evidence_sha256) = self.source_evidence_sha256.clone() else {
+
             self.error = Some(String::from(
+
                 "Cannot save forensic artifacts: source evidence is not verified",
+
             ));
+
             return;
+
         };
 
-        let Some(result) = &self.result else {
+let Some(result) = &self.result else {
+
             self.error = Some(String::from("Nothing to save yet"));
+
             return;
+
         };
 
-        let Some(dir) = rfd::FileDialog::new().pick_folder() else {
+let Some(dir) = rfd::FileDialog::new().pick_folder() else {
+
             return;
+
         };
 
         if let Err(err) = std::fs::create_dir_all(&dir) {
+
             self.error = Some(err.to_string());
+
             return;
+
         }
 
-        let mut new_artifacts = Vec::new();
+let mut new_artifacts = Vec::new();
 
         for decoded in &result.frames {
-            let stem = format!(
+
+let stem = format!(
+
                 "frame_{:05}_off_{:010}{}",
+
                 decoded.record.index,
+
                 decoded.record.offset,
+
                 if decoded.record.partial { "_partial" } else { "" }
+
             );
 
-            let path = dir.join(format!("{stem}.png"));
+let path = dir.join(format!("{stem}.png"));
 
-            let artifact = match write_artifact_new(
+let artifact = match write_artifact_new(
+
                 &path,
+
                 &decoded.png,
+
                 "RECOVERED_FRAME_PNG",
+
                 source_evidence_sha256.clone(),
+
             ) {
+
                 Ok(artifact) => artifact,
+
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+
                     self.artifacts = new_artifacts;
+
                     self.error = Some(format!(
+
                         "Refusing to overwrite existing forensic artifact: {}",
+
                         path.display()
+
                     ));
+
                     self.status = String::from(
+
                         "Artifact export stopped: existing file detected",
+
                     );
+
                     return;
+
                 }
+
                 Err(err) => {
+
                     self.artifacts = new_artifacts;
+
                     self.error = Some(format!(
+
                         "Writing forensic artifact {} failed: {err}",
+
                         path.display()
+
                     ));
+
                     self.status = String::from("Artifact export failed");
+
                     return;
+
                 }
+
             };
 
             new_artifacts.push(artifact);
+
         }
 
-        let count = new_artifacts.len();
+let count = new_artifacts.len();
+
         self.artifacts = new_artifacts;
+
         self.error = None;
+
         self.status = format!(
+
             "{count} forensic artifacts saved and SHA-256 hashed in {}",
+
             dir.display()
+
         );
+
     }
 
     pub fn artifacts(&self) -> &[ArtifactRecord] {
+
         &self.artifacts
+
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -1320,12 +1433,18 @@ fn run_extract(
     matrix: ColorMatrix,
 
     reporter: &mut dyn Reporter,
+    expected_sha256: String,
 
 ) -> Result<Extracted, String> {
 
 let data = read_input(path, reporter).map_err(|e| e.to_string())?;
 
-let name = path.display().to_string();
+use sha2::{Digest, Sha256};
+    let actual_sha256 = hex::encode(Sha256::digest(&data));
+    if actual_sha256 != expected_sha256 {
+        return Err("CRITICAL: extraction input bytes do not match verified evidence".into());
+    }
+    let name = path.display().to_string();
 
 let extraction =
 
