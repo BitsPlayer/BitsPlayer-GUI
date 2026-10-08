@@ -21,14 +21,14 @@ use crate::forensic::evidence::{
     IntegrityStatus,
 };
 
-use crate::theme;
+use crate::presentation::theme;
 
-use crate::widgets::file_map::{
+use crate::presentation::widgets::file_map::{
     FileMap,
     MapMessage,
 };
 
-use crate::widgets::hex_view;
+use crate::presentation::widgets::hex_view;
 
 #[derive(Debug, Clone)]
 pub enum Message {

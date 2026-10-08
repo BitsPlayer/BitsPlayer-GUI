@@ -5,15 +5,15 @@ use std::time::Duration;
 use iced::window;
 use iced::{Element, Fill, Font, Size, Subscription, Task, Theme};
 
-use crate::analyze;
-use crate::extract::{self, SaveOutcome};
+use crate::presentation::analyze;
+use crate::presentation::extract::{self, SaveOutcome};
 use crate::forensic::audit::{AuditAction, AuditLogger, AuditResult};
 use crate::forensic::case::Case;
 use crate::forensic::context::{HostContext, OperationContext};
 use crate::forensic::evidence::IntegrityStatus;
 use crate::forensic::seal::SealReport;
 use crate::forensic::signing::IdentityOrigin;
-use crate::theme;
+use crate::presentation::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tab {

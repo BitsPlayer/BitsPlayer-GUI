@@ -6,7 +6,7 @@ use iced::widget::canvas::{self, Event, Geometry, Text};
 use iced::widget::{Space, button, column, container, row, text};
 use iced::{Color, Element, Fill, Font, Point, Rectangle, Renderer, Size, Theme};
 
-use crate::theme;
+use crate::presentation::theme;
 
 /// Bytes shown in the hex window. Larger spans are truncated with a note.
 pub const MAX_BYTES: u64 = 64 * 1024;

@@ -3,7 +3,7 @@ use iced::widget::{Space, column, container, image, mouse_area, row, text};
 use iced::{Element, Length};
 use iframe_extract::report::human_bytes;
 
-use crate::theme;
+use crate::presentation::theme;
 
 #[derive(Clone)]
 pub struct Thumb {
@@ -19,8 +19,8 @@ pub fn view(
     thumbs: &[Thumb],
     selected: Option<usize>,
     cols: usize,
-    on_select: impl Fn(usize) -> crate::extract::Message + Copy + 'static,
-) -> Element<'static, crate::extract::Message> {
+    on_select: impl Fn(usize) -> crate::presentation::extract::Message + Copy + 'static,
+) -> Element<'static, crate::presentation::extract::Message> {
     if thumbs.is_empty() {
         return column![].into();
     }
@@ -39,8 +39,8 @@ pub fn view(
 fn thumb_card(
     thumb: &Thumb,
     selected: bool,
-    on_select: impl Fn(usize) -> crate::extract::Message + Copy + 'static,
-) -> Element<'static, crate::extract::Message> {
+    on_select: impl Fn(usize) -> crate::presentation::extract::Message + Copy + 'static,
+) -> Element<'static, crate::presentation::extract::Message> {
     let label = format!(
         "I {:>5}  off {:>10}{}",
         thumb.index,
@@ -79,7 +79,7 @@ fn thumb_card(
     mouse_area(card).on_press(on_select(thumb.index)).into()
 }
 
-pub fn preview<'a>(handle: Handle, caption: String) -> Element<'a, crate::extract::Message> {
+pub fn preview<'a>(handle: Handle, caption: String) -> Element<'a, crate::presentation::extract::Message> {
     column![
         container(image(handle).width(Length::Fill))
             .width(Length::Fill)

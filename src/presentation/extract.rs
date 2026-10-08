@@ -30,9 +30,9 @@ use crate::forensic::artifact::{
 
 use crate::forensic::context::ExtractionParameters;
 
-use crate::theme;
+use crate::presentation::theme;
 
-use crate::widgets::frame_grid::{self, Thumb};
+use crate::presentation::widgets::frame_grid::{self, Thumb};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 
