@@ -7,9 +7,11 @@ in the **BitsPlayer-GUI** project. It is intended to help all team
 members understand what has changed, why it was added, how the current
 implementation works, and what remains to be implemented.
 
-> **Current status:** The original MP4 analysis/recovery application is
-> still intact. We have added an initial forensic evidence-integrity,
-> case-management, and tamper-evident audit foundation around it.
+> **Current status:** Analyze and Extract still do the MP4 work. Each
+> session now keeps a hash-chained audit, seals that chain when the
+> window closes, and shows the chain in the Custody tab. Closing the
+> window runs the same verifier as `bitsplayer-verify` and leaves the
+> checklist on screen until the examiner exits.
 
 ------------------------------------------------------------------------
 
@@ -18,16 +20,19 @@ implementation works, and what remains to be implemented.
 BitsPlayer is a Rust/Iced desktop application for forensic MP4 analysis
 and truncated H.264 video recovery.
 
-The existing application already had two main workflows:
+The application has three main workflows:
 
 -   **Analyze** --- inspect MP4 structure, metadata, file layout,
     GOP/frame information, and selected bytes through a hex viewer.
 -   **Extract** --- recover/decode frames from damaged or truncated
     MP4/H.264 files and export recovered frames as PNG images.
+-   **Custody** --- show the open case, the host and build that
+    produced it, and the hash-chained audit of what this session did.
 
-The main GUI is under `src/`, while the main analysis/recovery engines
-are provided by the vendored `video-analyzer` and `iframe-extract`
-crates.
+The GUI lives under `src/presentation/`. The forensic rules live under
+`src/domain/`, `src/application/`, and `src/infrastructure/`. The
+analysis and recovery engines are the vendored `video-analyzer` and
+`iframe-extract` crates.
 
 The new work described below focuses on making the tool more
 **forensically defensible**, particularly around evidence integrity,
@@ -37,34 +42,37 @@ traceability, and reproducibility.
 
 ## 2. New forensic module structure
 
-A new forensic subsystem has been introduced:
+Forensic bookkeeping is split into layers. `src/forensic/mod.rs` is a
+facade the GUI and the verify command use. It does not own the types.
 
 ``` text
 src/
-├── forensic/
-│   ├── mod.rs
-│   ├── hashing.rs
-│   ├── evidence.rs
+├── domain/            entities and hash-chain math, no filesystem
+│   ├── artifact.rs
+│   ├── audit.rs
 │   ├── case.rs
-│   └── audit.rs
-├── analyze.rs
-├── app.rs
-├── extract.rs
-├── main.rs
-└── ...
+│   ├── closure.rs
+│   ├── context.rs
+│   ├── evidence.rs
+│   ├── provenance.rs
+│   └── signing.rs
+├── application/       use cases
+│   ├── seal.rs        write closure, signature, and CASE_CLOSED
+│   ├── verify.rs      VerificationReport for a sealed case
+│   └── ports.rs
+├── infrastructure/    filesystem, hashing, keys, audit log
+├── presentation/
+│   ├── app.rs
+│   ├── analyze.rs
+│   ├── extract.rs
+│   ├── custody.rs     chain of custody and the seal review
+│   └── verify_cli.rs  bitsplayer-verify
+└── forensic/mod.rs    re-exports the layers above
 ```
 
-`src/forensic/mod.rs` exposes the forensic modules:
-
-``` rust
-pub mod audit;
-pub mod case;
-pub mod evidence;
-pub mod hashing;
-```
-
-The goal is to keep forensic bookkeeping separate from the existing MP4
-analysis/recovery implementation.
+The domain layer does not read or write files. The application layer
+calls ports. The GUI records audit entries but does not hash them
+itself.
 
 ------------------------------------------------------------------------
 
@@ -72,7 +80,7 @@ analysis/recovery implementation.
 
 ### What was implemented
 
-`src/forensic/hashing.rs` now contains a reusable SHA-256 file hashing
+`src/infrastructure/hashing.rs` contains a reusable SHA-256 file hashing
 function.
 
 The implementation reads files using a **1 MiB streaming buffer** rather
@@ -125,7 +133,7 @@ The BitsPlayer hash matched `sha256sum` exactly.
 
 ## 4. EvidenceRecord
 
-`src/forensic/evidence.rs` introduces:
+`src/domain/evidence.rs` introduces:
 
 ``` rust
 pub struct EvidenceRecord {
@@ -193,7 +201,7 @@ byte-for-byte identical to the file registered before analysis.
 
 ## 6. Analyze UI integration
 
-`src/analyze.rs` has been updated to store:
+`src/presentation/analyze.rs` stores:
 
 ``` rust
 pub evidence: Option<EvidenceRecord>
@@ -264,7 +272,8 @@ modification.
 
 ## 8. Case model
 
-`src/forensic/case.rs` introduces a forensic `Case`.
+`src/domain/case.rs` introduces a forensic `Case`. Persistence is in
+`src/infrastructure/case.rs`.
 
 Current structure:
 
@@ -356,7 +365,8 @@ structure.
 
 ## 11. Audit logging
 
-`src/forensic/audit.rs` introduces an `AuditLogger`.
+`src/infrastructure/audit.rs` introduces an `AuditLogger`. The entry
+type and the hash payload live in `src/domain/audit.rs`.
 
 Audit entries currently contain:
 
@@ -385,38 +395,31 @@ manually.
 
 ## 12. Actions currently recorded
 
-When the application creates a case and analyzes evidence, the audit
-trail currently records:
+A session can record:
 
 ``` text
 CASE_CREATED
-    ↓
 EVIDENCE_REGISTERED
-    ↓
-ANALYSIS_COMPLETED
-    ↓
+ANALYSIS_STARTED
+ANALYSIS_COMPLETED or ANALYSIS_FAILED
 INTEGRITY_VERIFICATION
+EXTRACT_STARTED
+EXTRACT_COMPLETED or EXTRACT_FAILED
+ARTIFACT_CREATED
+CASE_CLOSED
 ```
 
-For the integrity verification event, the result is recorded as:
+`ANALYSIS_STARTED` is written before analysis runs. `EXTRACT_STARTED`
+and `EXTRACT_COMPLETED` carry the extraction parameter snapshot
+(dimensions, matrix, and the include flags). `ARTIFACT_CREATED` carries
+the recovered file name, type, size, SHA-256, and the source evidence
+hash. `CASE_CLOSED` is written only when the window-close seal
+succeeds.
 
-``` text
-verified
-```
-
-when successful.
-
-The application version is automatically included using:
-
-``` rust
-env!("CARGO_PKG_VERSION")
-```
-
-The current tested version was:
-
-``` text
-0.1.0
-```
+Each entry also stores build provenance: tool version, git commit,
+Cargo.lock SHA-256, and the running binary's SHA-256. The version comes
+from `CARGO_PKG_VERSION`. The commit and lock hash are captured at
+build time; the build refuses to proceed when either is unknown.
 
 ------------------------------------------------------------------------
 
@@ -609,33 +612,33 @@ The tested functionality includes:
 
 ## 19. Current case workflow
 
-At present, application startup effectively performs:
+Startup and shutdown currently do this:
 
 ``` text
 Start BitsPlayer
       ↓
-Generate UUID
+Create cases/CASE-<uuid>/
       ↓
-Create CASE-xxxxxxxx directory
-      ↓
-Create case.json
-      ↓
-Initialize logs/audit.jsonl
+Write case.json and logs/audit.jsonl
       ↓
 Write CASE_CREATED
       ↓
-User selects MP4
+Analyze and Extract append audit entries
       ↓
-Calculate SHA-256
+Custody tab shows those entries
       ↓
-Analyze MP4
+Close the main window
       ↓
-Recalculate SHA-256
+Seal: case_closure.json, case_signature.json, CASE_CLOSED
       ↓
-Verify evidence unchanged
+Run the sealed-case verifier
       ↓
-Write evidence/analysis/integrity audit events
+Leave the checklist on screen until Exit
 ```
+
+Recovered PNGs are written to a folder the examiner picks. That folder
+is not inside the case directory. The seal review passes every folder
+that received a logged artifact.
 
 ------------------------------------------------------------------------
 
@@ -646,116 +649,98 @@ BitsPlayer-GUI/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── cases/
-│   ├── CASE-68bf4adf/
-│   │   ├── case.json
-│   │   └── logs/
-│   │       └── audit.jsonl
-│   └── current_session/
+│   └── CASE-<uuid>/
+│       ├── case.json
+│       ├── case_closure.json      after a successful seal
+│       ├── case_signature.json    after a successful seal
 │       └── logs/
 │           └── audit.jsonl
-│
 └── src/
-    ├── forensic/
-    │   ├── mod.rs
-    │   ├── hashing.rs
-    │   ├── evidence.rs
-    │   ├── case.rs
-    │   └── audit.rs
-    ├── analyze.rs
-    ├── app.rs
-    ├── extract.rs
-    └── ...
+    ├── domain/
+    ├── application/
+    ├── infrastructure/
+    ├── presentation/
+    └── forensic/mod.rs
 ```
+
+The signing key is not stored in the case. It lives under
+`~/.config/bitsplayer/signing/` (`private.key` and `public.key`).
+`bitsplayer-verify` trusts `public.key` from that directory unless
+`--public-key` points somewhere else.
 
 `current_session` is legacy development output and is no longer the
 intended case structure.
 
 ------------------------------------------------------------------------
 
-## 21. What has NOT been completed yet
+## 21. Chain of custody in the GUI
 
-The forensic layer is still under development.
+The Custody tab reads the audit entries this process has already
+committed. Opening the tab does not write an audit event.
 
-The following are important remaining tasks.
+It shows:
 
-### Proper Case UI
+-   case name, id, examiner, directory, created time, and whether the
+    case is still open;
+-   host, operating system, architecture, tool version, git commit,
+    Cargo.lock hash, and binary hash, taken from the first entry;
+-   chain length and the current head hash;
+-   one row per entry: sequence, time, action, result, evidence or
+    artifact name, a short hash, and the extraction parameters when
+    that entry has them.
 
-Currently a case is automatically created with:
+The Analyze sidebar still shows evidence integrity and the full
+evidence SHA-256. That line is unchanged.
+
+### Seal review
+
+Closing the main window seals the case. A successful seal does not
+exit. The same task re-reads `audit.jsonl` with `read_verified_audit`
+(so `CASE_CLOSED` appears on the chain) and runs
+`verify_case_directories`.
+
+The review replaces the tab body. It shows the closure path, the
+signature path, the public key path, and whether the signing identity
+was loaded or just created. A new identity is called out on that
+screen, because the signature is only meaningful once that public key
+is trusted. Then it lists every line of `VerificationReport`: the
+`[OK]` checks, the warnings, or the verifier error.
+
+Exit leaves the application. Closing the window a second time also
+exits, including when verification failed. The case is already sealed
+on disk; the review is what the examiner reads before leaving.
+
+`verify_case` refuses a log whose last action is not `CASE_CLOSED`, so
+the live Custody tab does not call it.
+
+### What the verifier checks
+
+`bitsplayer-verify` and the seal review both use
+`src/application/verify.rs`. `VerificationReport` is the custody
+report. There is no separate PDF or Markdown generator.
+
+The check covers `case.json`, the hash chain, a stable host and
+examiner, operation context on analysis and extraction entries, the
+closure file, the Ed25519 signature against a trusted public key,
+build provenance, and artifact bytes. The command line still takes one
+`--artifact-dir`. The GUI passes every directory that received an
+artifact this session. A filename must match exactly one file across
+those directories. A case with no `ARTIFACT_CREATED` entries does not
+need a directory.
+
+### Still absent
+
+The GUI still creates the case automatically:
 
 ``` text
 name = "BitsPlayer Session"
-examiner = null
+examiner = BITSPLAYER_EXAMINER, or absent when that variable is unset
 ```
 
-The intended next step is to add a GUI where an examiner can provide:
-
--   case name/number;
--   examiner/operator name;
--   potentially other case metadata.
-
-Analysis/extraction can then operate inside the selected/created case.
-
-### Extraction workflow integration
-
-The forensic evidence/audit work has mainly been integrated with
-**Analyze** so far.
-
-The **Extract** workflow still needs equivalent integration, including:
-
--   source evidence registration/association;
--   pre/post extraction integrity verification;
--   extraction parameters in the audit trail;
--   extraction start/completion/failure events;
--   recovered-artifact registration.
-
-### Artifact integrity
-
-Recovered PNG files should eventually have their own records containing:
-
--   output path;
--   artifact type;
--   size;
--   SHA-256;
--   creation time;
--   originating evidence SHA-256.
-
-Existing output files should also not be silently overwritten.
-
-### Forensic reporting
-
-A final report generator still needs to be implemented.
-
-A report should eventually contain items such as:
-
-``` text
-Case ID
-Case name
-Examiner
-Tool version
-Evidence filename
-Evidence SHA-256
-Evidence size
-Integrity verification result
-Analysis details
-Extraction parameters
-Recovered artifacts
-Artifact hashes
-Warnings/errors
-Audit verification status
-```
-
-### Better tool/build provenance
-
-The audit currently records the Cargo package version.
-
-A later improvement may also record the Git commit/build identifier so
-that the exact source revision used for an examination can be
-identified.
-
-### Existing-case workflow
-
-Although `Case::load()` and audit resumption exist, the GUI does not yet
-provide a complete **Open Existing Case** workflow.
+There is no field for the case name or the examiner. There is no Open
+Existing Case flow, even though `Case::load()` and audit resumption
+exist. Opening the Custody tab and showing the seal review do not add
+either of those.
 
 ------------------------------------------------------------------------
 
@@ -823,58 +808,54 @@ structured audit trail
         +
 hash-chained tamper detection
         +
-automated validation tests
+extraction parameters and artifact hashes
+        +
+build provenance
+        +
+Ed25519 case seal
+        +
+Custody tab and seal review
+        +
+bitsplayer-verify
 ```
 
-The core MP4 analysis/recovery functionality remains the project's
-primary purpose. The new forensic subsystem provides the foundation
-required to make those operations more traceable and defensible.
+Analyze and Extract remain the primary workflows. The Custody tab and
+the seal review show the record those workflows already write.
 
 ------------------------------------------------------------------------
 
 ## 24. Recommended next implementation order
 
-The current recommended development sequence is:
+Extract auditing, artifact hashing, overwrite refusal, extraction
+parameters, build provenance, closure, and Ed25519 sealing are in
+place. The Custody tab and the seal review expose that record.
+
+What is still missing:
 
 ``` text
-1. Case creation UI
+1. Case name and examiner fields in the GUI
         ↓
-2. Examiner/case metadata
+2. Open an existing sealed case
         ↓
-3. Open existing case
-        ↓
-4. Integrate Extract with forensic case/audit system
-        ↓
-5. Artifact records + SHA-256 hashing
-        ↓
-6. Prevent silent artifact overwrites
-        ↓
-7. Record extraction parameters/results
-        ↓
-8. Generate forensic report
-        ↓
-9. Validation/corpus metrics
-        ↓
-10. Final documentation and evaluation
+3. Validation and corpus metrics
 ```
 
 ------------------------------------------------------------------------
 
 ## Team handover note
 
-Before modifying the forensic subsystem, team members should be aware
-that `hashing.rs`, `evidence.rs`, `case.rs`, and `audit.rs` now form a
-connected integrity/audit layer. Changes to serialized case/audit
-structures may affect existing `case.json` or `audit.jsonl`
-compatibility.
+The connected layer is `src/domain/`, `src/application/`, and
+`src/infrastructure/`. `src/forensic/mod.rs` only re-exports it.
+Changes to serialized case, audit, closure, or signature structures
+may affect existing `case.json`, `audit.jsonl`, `case_closure.json`,
+and `case_signature.json` files.
 
 When making changes, run:
 
 ``` bash
 cargo check
-cargo test forensic
+cargo test --lib
 ```
 
-before continuing.
-
-The latest confirmed checkpoint had all forensic tests passing.
+before continuing. The forensic tests live with the library, not under
+a separate `forensic` filter name.

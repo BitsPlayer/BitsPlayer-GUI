@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -6,13 +6,14 @@ use iced::window;
 use iced::{Element, Fill, Font, Size, Subscription, Task, Theme};
 
 use crate::presentation::analyze;
+use crate::presentation::custody;
 use crate::presentation::extract::{self, SaveOutcome};
-use crate::forensic::audit::{AuditAction, AuditLogger, AuditResult};
+use crate::forensic::audit::{AuditAction, AuditEntry, AuditLogger, AuditResult};
 use crate::forensic::case::Case;
 use crate::forensic::context::{HostContext, OperationContext};
 use crate::forensic::evidence::IntegrityStatus;
 use crate::forensic::seal::SealReport;
-use crate::forensic::signing::IdentityOrigin;
+use crate::forensic::verify::VerificationReport;
 use crate::presentation::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -20,6 +21,14 @@ pub enum Tab {
     #[default]
     Analyze,
     Extract,
+    Custody,
+}
+
+#[derive(Debug, Clone)]
+pub struct SealedCase {
+    report: SealReport,
+    entries: Result<Vec<AuditEntry>, String>,
+    verification: Result<VerificationReport, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -27,7 +36,8 @@ pub enum Message {
     MainOpened,
     HexOpened,
     CloseRequested(window::Id),
-    CaseSealed(Result<SealReport, String>),
+    CaseSealed(Result<SealedCase, String>),
+    Exit,
     Tab(Tab),
     Analyze(analyze::Message),
     Extract(extract::Message),
@@ -41,8 +51,11 @@ pub struct App {
     extract: extract::State,
     case: Case,
     audit: Arc<Mutex<Option<AuditLogger>>>,
+    audit_entries: Vec<AuditEntry>,
+    artifact_directories: Vec<PathBuf>,
     case_closed: bool,
     sealing: bool,
+    seal_review: Option<SealedCase>,
     notice: Option<String>,
     active_extraction: Option<OperationContext>,
 }
@@ -55,16 +68,11 @@ impl App {
     fn spawn_seal(&self) -> Task<Message> {
         let audit = Arc::clone(&self.audit);
         let case = self.case.clone();
+        let artifact_directories = self.artifact_directories.clone();
         Task::perform(
             async move {
                 match tokio::task::spawn_blocking(move || {
-                    let mut guard = audit.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let Some(logger) = guard.as_mut() else {
-                        return Err(String::from(
-                            "Cannot seal forensic case: audit logger is unavailable",
-                        ));
-                    };
-                    crate::forensic::seal::seal_case(logger, &case).map_err(|err| err.to_string())
+                    seal_and_verify(audit, case, artifact_directories)
                 })
                 .await
                 {
@@ -74,6 +82,19 @@ impl App {
             },
             Message::CaseSealed,
         )
+    }
+
+    fn remember_artifact_directory(&mut self, path: &Path) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if parent.as_os_str().is_empty() || !parent.is_dir() {
+            return;
+        }
+        if self.artifact_directories.iter().any(|existing| existing == parent) {
+            return;
+        }
+        self.artifact_directories.push(parent.to_path_buf());
     }
 
     pub fn boot() -> (Self, Task<Message>) {
@@ -115,8 +136,9 @@ impl App {
             }
         };
 
+        let mut audit_entries = Vec::new();
         if let Some(logger) = audit.as_mut() {
-            if let Err(err) = logger.log(
+            match logger.log(
                 case.id,
                 AuditAction::CaseCreated,
                 None,
@@ -124,7 +146,8 @@ impl App {
                 case_metadata_sha256,
                 AuditResult::Success,
             ) {
-                eprintln!("Failed to write CASE_CREATED audit entry: {err}");
+                Ok(entry) => audit_entries.push(entry),
+                Err(err) => eprintln!("Failed to write CASE_CREATED audit entry: {err}"),
             }
         }
 
@@ -137,8 +160,11 @@ impl App {
                 extract: extract::State::default(),
                 case,
                 audit: Arc::new(Mutex::new(audit)),
+                audit_entries,
+                artifact_directories: Vec::new(),
                 case_closed: false,
                 sealing: false,
+                seal_review: None,
                 notice: None,
                 active_extraction: None,
             },
@@ -174,6 +200,7 @@ impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::MainOpened | Message::HexOpened => Task::none(),
+            Message::Exit => iced::exit(),
             Message::CloseRequested(id) => {
                 if id == self.main_window {
                     if self.case_closed {
@@ -197,20 +224,20 @@ impl App {
             Message::CaseSealed(result) => {
                 self.sealing = false;
                 match result {
-                    Ok(report) => {
+                    Ok(sealed) => {
                         self.case_closed = true;
-                        if report.identity_origin == IdentityOrigin::Created {
-                            let notice = format!(
-                                "A new signing identity was created at {}. The case is sealed. Close the window again to exit.",
-                                report.signing_directory.display()
-                            );
-                            self.notice = Some(notice.clone());
-                            self.analyze.status = notice.clone();
-                            self.extract.status = notice;
-                            Task::none()
-                        } else {
-                            iced::exit()
+                        self.notice = None;
+                        if let Ok(entries) = &sealed.entries {
+                            self.audit_entries.clone_from(entries);
                         }
+                        let status = match &sealed.verification {
+                            Ok(_) => String::from("Forensic case sealed. Review the custody report before exiting."),
+                            Err(_) => String::from("Forensic case sealed, but verification failed."),
+                        };
+                        self.analyze.status.clone_from(&status);
+                        self.extract.status = status;
+                        self.seal_review = Some(sealed);
+                        Task::none()
                     }
                     Err(err) => {
                         let notice = format!("Forensic case was not sealed: {err}");
@@ -224,6 +251,9 @@ impl App {
                 }
             }
             Message::Tab(tab) => {
+                if self.seal_review.is_some() {
+                    return Task::none();
+                }
                 self.tab = tab;
                 Task::none()
             }
@@ -289,30 +319,40 @@ impl App {
                     return Task::none();
                 };
 
-                logger
-                    .log_with_context(
+                let mut committed = Vec::new();
+                let mut failure = None;
+                match logger.log_with_context(
+                    case_id,
+                    AuditAction::EvidenceRegistered,
+                    Some(filename.clone()),
+                    Some(sha256.clone()),
+                    None,
+                    AuditResult::Success,
+                    context.clone(),
+                ) {
+                    Ok(entry) => committed.push(entry),
+                    Err(err) => failure = Some(err.to_string()),
+                }
+                if failure.is_none() {
+                    match logger.log_with_context(
                         case_id,
-                        AuditAction::EvidenceRegistered,
-                        Some(filename.clone()),
-                        Some(sha256.clone()),
+                        AuditAction::AnalysisStarted,
+                        Some(filename),
+                        Some(sha256),
                         None,
-                        AuditResult::Success,
-                        context.clone(),
-                    )
-                    .and_then(|_| {
-                        logger.log_with_context(
-                            case_id,
-                            AuditAction::AnalysisStarted,
-                            Some(filename),
-                            Some(sha256),
-                            None,
-                            AuditResult::Started,
-                            context,
-                        )
-                    })
+                        AuditResult::Started,
+                        context,
+                    ) {
+                        Ok(entry) => committed.push(entry),
+                        Err(err) => failure = Some(err.to_string()),
+                    }
+                }
+                (committed, failure)
             };
 
-            if let Err(err) = registered {
+            let (committed, failure) = registered;
+            self.audit_entries.extend(committed);
+            if let Some(err) = failure {
                 self.analyze.busy = false;
                 self.analyze.error = Some(format!(
                     "Failed to record analysis in the forensic audit: {err}"
@@ -435,12 +475,15 @@ impl App {
                 )
             };
 
-            if let Err(err) = started {
-                self.extract.error = Some(format!(
-                    "Failed to record extraction start in forensic audit: {err}"
-                ));
-                self.extract.status = String::from("Extraction blocked: audit write failed");
-                return Task::none();
+            match started {
+                Ok(entry) => self.audit_entries.push(entry),
+                Err(err) => {
+                    self.extract.error = Some(format!(
+                        "Failed to record extraction start in forensic audit: {err}"
+                    ));
+                    self.extract.status = String::from("Extraction blocked: audit write failed");
+                    return Task::none();
+                }
             }
 
             self.active_extraction = Some(context);
@@ -486,19 +529,23 @@ impl App {
                                 },
                                 context,
                             )
-                            .map(|_| ())
                             .map_err(|err| err.to_string()),
                     }
                 }
             };
 
-            if let Err(err) = recorded {
-                let existing = self.extract.error.clone();
-                self.extract.error = Some(match existing {
-                    Some(previous) => format!("{previous}\nForensic audit write failed: {err}"),
-                    None => format!("Extraction finished, but the forensic audit write failed: {err}"),
-                });
-                self.extract.status = String::from("Extraction audit failure");
+            match recorded {
+                Ok(entry) => self.audit_entries.push(entry),
+                Err(err) => {
+                    let existing = self.extract.error.clone();
+                    self.extract.error = Some(match existing {
+                        Some(previous) => format!("{previous}\nForensic audit write failed: {err}"),
+                        None => format!(
+                            "Extraction finished, but the forensic audit write failed: {err}"
+                        ),
+                    });
+                    self.extract.status = String::from("Extraction audit failure");
+                }
             }
         }
 
@@ -544,35 +591,58 @@ impl App {
         let logged = {
             let mut audit = self.audit_mut();
             match audit.as_mut() {
-                None => Err(String::from(
-                    "Artifacts were saved, but the forensic audit logger is unavailable.",
+                None => Err((
+                    Vec::new(),
+                    Vec::new(),
+                    String::from(
+                        "Artifacts were saved, but the forensic audit logger is unavailable.",
+                    ),
                 )),
                 Some(logger) => {
-                    let mut result = Ok(());
+                    let mut entries = Vec::new();
+                    let mut paths = Vec::new();
+                    let mut failure = None;
                     for artifact in &artifacts {
-                        if let Err(err) = logger.log_artifact_with_context(
+                        match logger.log_artifact_with_context(
                             case_id,
                             filename.clone(),
                             sha256.clone(),
                             artifact,
                             context.clone(),
                         ) {
-                            result = Err(format!(
-                                "Artifact was saved, but ARTIFACT_CREATED could not be logged: {err}"
-                            ));
-                            break;
+                            Ok(entry) => {
+                                paths.push(artifact.path.clone());
+                                entries.push(entry);
+                            }
+                            Err(err) => {
+                                failure = Some(format!(
+                                    "Artifact was saved, but ARTIFACT_CREATED could not be logged: {err}"
+                                ));
+                                break;
+                            }
                         }
                     }
-                    result
+                    match failure {
+                        Some(err) => Err((entries, paths, err)),
+                        None => Ok((entries, paths)),
+                    }
                 }
             }
         };
 
-        if let Err(err) = logged {
+        let (entries, paths, failure) = match logged {
+            Ok((entries, paths)) => (entries, paths, None),
+            Err((entries, paths, err)) => (entries, paths, Some(err)),
+        };
+        self.audit_entries.extend(entries);
+        for path in paths {
+            self.remember_artifact_directory(&path);
+        }
+        if let Some(err) = failure {
             let existing = self.extract.error.clone();
             self.extract.error = Some(match existing {
                 Some(previous) => format!("{previous}\n{err}"),
-                None => format!("Artifact was saved, but ARTIFACT_CREATED could not be logged: {err}"),
+                None => err,
             });
             self.extract.status = String::from("Artifact audit failure");
         }
@@ -596,15 +666,17 @@ impl App {
         let context = OperationContext::evidence(&path);
         let case_id = self.case.id;
 
-        let mut audit = self.audit_mut();
-        let Some(logger) = audit.as_mut() else {
-            return Err(String::from(
-                "Forensic audit logger is unavailable. Analysis was not recorded.",
-            ));
-        };
+        let entries = {
+            let mut audit = self.audit_mut();
+            let Some(logger) = audit.as_mut() else {
+                return Err(String::from(
+                    "Forensic audit logger is unavailable. Analysis was not recorded.",
+                ));
+            };
 
-        logger
-            .log_with_context(
+            let mut committed = Vec::new();
+            let mut failure = None;
+            match logger.log_with_context(
                 case_id,
                 AuditAction::AnalysisCompleted,
                 Some(filename.clone()),
@@ -612,21 +684,39 @@ impl App {
                 None,
                 AuditResult::Success,
                 context.clone(),
-            )
-            .map_err(|err| format!("Failed to write ANALYSIS_COMPLETED audit entry: {err}"))?;
-
-        logger
-            .log_with_context(
-                case_id,
-                AuditAction::IntegrityVerification,
-                Some(filename),
-                Some(sha256),
-                None,
-                integrity_result,
-                context,
-            )
-            .map_err(|err| format!("Failed to write INTEGRITY_VERIFICATION audit entry: {err}"))?;
-
+            ) {
+                Ok(entry) => committed.push(entry),
+                Err(err) => {
+                    failure = Some(format!(
+                        "Failed to write ANALYSIS_COMPLETED audit entry: {err}"
+                    ));
+                }
+            }
+            if failure.is_none() {
+                match logger.log_with_context(
+                    case_id,
+                    AuditAction::IntegrityVerification,
+                    Some(filename),
+                    Some(sha256),
+                    None,
+                    integrity_result,
+                    context,
+                ) {
+                    Ok(entry) => committed.push(entry),
+                    Err(err) => {
+                        failure = Some(format!(
+                            "Failed to write INTEGRITY_VERIFICATION audit entry: {err}"
+                        ));
+                    }
+                }
+            }
+            (committed, failure)
+        };
+        let (committed, failure) = entries;
+        self.audit_entries.extend(committed);
+        if let Some(err) = failure {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -637,36 +727,39 @@ impl App {
         let context = evidence.map(|e| OperationContext::evidence(&e.path));
         let case_id = self.case.id;
 
-        let mut audit = self.audit_mut();
-        let Some(logger) = audit.as_mut() else {
-            return Err(String::from(
-                "Forensic audit logger is unavailable. Analysis failure was not recorded.",
-            ));
-        };
+        let entry = {
+            let mut audit = self.audit_mut();
+            let Some(logger) = audit.as_mut() else {
+                return Err(String::from(
+                    "Forensic audit logger is unavailable. Analysis failure was not recorded.",
+                ));
+            };
 
-        let result = match context {
-            Some(context) => logger.log_with_context(
-                case_id,
-                AuditAction::AnalysisFailed,
-                filename,
-                sha256,
-                None,
-                AuditResult::Failed,
-                context,
-            ),
-            None => logger.log(
-                case_id,
-                AuditAction::AnalysisFailed,
-                filename,
-                sha256,
-                None,
-                AuditResult::Failed,
-            ),
-        };
+            let result = match context {
+                Some(context) => logger.log_with_context(
+                    case_id,
+                    AuditAction::AnalysisFailed,
+                    filename,
+                    sha256,
+                    None,
+                    AuditResult::Failed,
+                    context,
+                ),
+                None => logger.log(
+                    case_id,
+                    AuditAction::AnalysisFailed,
+                    filename,
+                    sha256,
+                    None,
+                    AuditResult::Failed,
+                ),
+            };
 
-        result.map_err(|err| {
-            format!("Failed to write ANALYSIS_FAILED audit entry for '{failure}': {err}")
-        })?;
+            result.map_err(|err| {
+                format!("Failed to write ANALYSIS_FAILED audit entry for '{failure}': {err}")
+            })?
+        };
+        self.audit_entries.push(entry);
         Ok(())
     }
 
@@ -698,6 +791,7 @@ impl App {
             return self.analyze.hex_window_view().map(Message::Analyze);
         }
 
+        let reviewing = self.seal_review.is_some();
         let file_hint = match self.tab {
             Tab::Analyze => self
                 .analyze
@@ -713,6 +807,12 @@ impl App {
                 .and_then(|p| p.file_name())
                 .and_then(|s| s.to_str())
                 .unwrap_or(""),
+            Tab::Custody => self
+                .case
+                .case_directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(""),
         };
 
         let header = iced::widget::container(
@@ -725,8 +825,24 @@ impl App {
                 ]
                 .spacing(2),
                 iced::widget::Space::with_width(24),
-                tab_btn("Analyze", Tab::Analyze, self.tab),
-                tab_btn("Extract", Tab::Extract, self.tab),
+                tab_btn(
+                    "Analyze",
+                    Tab::Analyze,
+                    !reviewing && self.tab == Tab::Analyze,
+                    !reviewing,
+                ),
+                tab_btn(
+                    "Extract",
+                    Tab::Extract,
+                    !reviewing && self.tab == Tab::Extract,
+                    !reviewing,
+                ),
+                tab_btn(
+                    "Custody",
+                    Tab::Custody,
+                    !reviewing && self.tab == Tab::Custody,
+                    !reviewing,
+                ),
                 iced::widget::Space::with_width(Fill),
                 iced::widget::text(file_hint)
                     .size(12)
@@ -740,9 +856,28 @@ impl App {
         .width(Fill)
         .style(theme::header_bar);
 
-        let body: Element<_> = match self.tab {
-            Tab::Analyze => self.analyze.view().map(Message::Analyze),
-            Tab::Extract => self.extract.view().map(Message::Extract),
+        let body: Element<_> = if let Some(sealed) = &self.seal_review {
+            custody::seal_review(
+                custody::Review {
+                    report: &sealed.report,
+                    verification: &sealed.verification,
+                },
+                Message::Exit,
+            )
+        } else {
+            match self.tab {
+                Tab::Analyze => self.analyze.view().map(Message::Analyze),
+                Tab::Extract => self.extract.view().map(Message::Extract),
+                Tab::Custody => custody::view(custody::Snapshot {
+                    case_name: &self.case.name,
+                    case_id: self.case.id,
+                    examiner: self.case.examiner.as_deref(),
+                    case_directory: &self.case.case_directory,
+                    created_at: self.case.created_at,
+                    open: !self.case_closed,
+                    entries: &self.audit_entries,
+                }),
+            }
         };
 
         let mut column = iced::widget::column![header];
@@ -761,10 +896,51 @@ impl App {
     }
 }
 
-fn tab_btn(label: &'static str, tab: Tab, current: Tab) -> Element<'static, Message> {
-    iced::widget::button(iced::widget::text(label).size(14))
-        .on_press(Message::Tab(tab))
-        .style(theme::tab_button(tab == current))
-        .padding([8, 16])
-        .into()
+fn tab_btn(
+    label: &'static str,
+    tab: Tab,
+    active: bool,
+    enabled: bool,
+) -> Element<'static, Message> {
+    let button = iced::widget::button(iced::widget::text(label).size(14))
+        .style(theme::tab_button(active))
+        .padding([8, 16]);
+    if enabled {
+        button.on_press(Message::Tab(tab)).into()
+    } else {
+        button.into()
+    }
+}
+
+fn seal_and_verify(
+    audit: Arc<Mutex<Option<AuditLogger>>>,
+    case: Case,
+    artifact_directories: Vec<PathBuf>,
+) -> Result<SealedCase, String> {
+    let report = {
+        let mut guard = audit.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(logger) = guard.as_mut() else {
+            return Err(String::from(
+                "Cannot seal forensic case: audit logger is unavailable",
+            ));
+        };
+        crate::forensic::seal::seal_case(logger, &case).map_err(|err| err.to_string())?
+    };
+
+    let audit_path = case.case_directory.join("logs").join("audit.jsonl");
+    let entries = crate::forensic::audit::read_verified_audit(&audit_path, case.id);
+    let verification = match &entries {
+        Ok(_) => crate::forensic::verify::verify_case_directories(
+            &case.case_directory,
+            &artifact_directories,
+            &report.signing_directory.join("public.key"),
+        ),
+        Err(err) => Err(format!("sealed audit log could not be re-read: {err}")),
+    };
+
+    Ok(SealedCase {
+        report,
+        entries,
+        verification,
+    })
 }

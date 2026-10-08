@@ -2,6 +2,7 @@
 
 pub mod analyze;
 pub mod app;
+pub mod custody;
 pub mod extract;
 pub mod theme;
 pub mod verify_cli;

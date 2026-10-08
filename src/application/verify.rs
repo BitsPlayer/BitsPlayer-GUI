@@ -29,6 +29,19 @@ pub fn verify_case(
     artifact_directory: Option<&Path>,
     trusted_public_key: &Path,
 ) -> Result<VerificationReport, String> {
+    let directories = artifact_directory
+        .map(|directory| vec![directory.to_path_buf()])
+        .unwrap_or_default();
+    verify_case_directories(case_directory, &directories, trusted_public_key)
+}
+
+/// Verifies a sealed case. Artifact filenames are resolved across every
+/// supplied directory and must match exactly one file.
+pub fn verify_case_directories(
+    case_directory: &Path,
+    artifact_directories: &[PathBuf],
+    trusted_public_key: &Path,
+) -> Result<VerificationReport, String> {
     let mut summary = VerificationReport::default();
 
     if !case_directory.exists() {
@@ -199,7 +212,7 @@ pub fn verify_case(
         &mut summary,
     )?;
 
-    verify_artifact_entries(&entries, artifact_directory, &mut summary)?;
+    verify_artifact_entries(&entries, artifact_directories, &mut summary)?;
     verify_provenance(&entries, &mut summary)?;
     Ok(summary)
 }
@@ -470,7 +483,7 @@ pub fn artifact_file_path(directory: &Path, filename: &str) -> Result<PathBuf, S
 
 fn verify_artifact_entries(
     entries: &[AuditEntry],
-    artifact_directory: Option<&Path>,
+    artifact_directories: &[PathBuf],
     summary: &mut VerificationReport,
 ) -> Result<(), String> {
     let artifact_entries: Vec<&AuditEntry> = entries
@@ -493,17 +506,19 @@ fn verify_artifact_entries(
         }
     ));
 
-    let Some(directory) = artifact_directory else {
+    if artifact_directories.is_empty() {
         return Err(String::from(
             "artifact records exist, but --artifact-dir was not supplied; refusing to treat the case as verified",
         ));
-    };
+    }
 
-    if !directory.is_dir() {
-        return Err(format!(
-            "artifact directory does not exist or is not a directory: {}",
-            directory.display()
-        ));
+    for directory in artifact_directories {
+        if !directory.is_dir() {
+            return Err(format!(
+                "artifact directory does not exist or is not a directory: {}",
+                directory.display()
+            ));
+        }
     }
 
     for entry in artifact_entries {
@@ -532,7 +547,7 @@ fn verify_artifact_entries(
             ));
         }
 
-        let path = artifact_file_path(directory, filename)?;
+        let path = locate_artifact(artifact_directories, filename)?;
         let metadata = std::fs::metadata(&path).map_err(|error| {
             format!("artifact missing or unreadable {}: {error}", path.display())
         })?;
@@ -557,6 +572,34 @@ fn verify_artifact_entries(
     }
 
     Ok(())
+}
+
+fn locate_artifact(directories: &[PathBuf], filename: &str) -> Result<PathBuf, String> {
+    let mut found = Vec::new();
+    let mut seen_directories = Vec::new();
+
+    for directory in directories {
+        let key = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.clone());
+        if seen_directories.iter().any(|existing| existing == &key) {
+            continue;
+        }
+        seen_directories.push(key);
+
+        let path = artifact_file_path(directory, filename)?;
+        if path.is_file() {
+            found.push(path);
+        }
+    }
+
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(format!(
+            "artifact missing or unreadable: {filename} was not found in the supplied artifact directories"
+        )),
+        _ => Err(format!(
+            "artifact filename {filename} matches more than one file across the supplied directories"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -751,5 +794,78 @@ mod tests {
         let _ = fs::remove_dir_all(&case.case_directory);
         let _ = fs::remove_dir_all(key_dir);
         let _ = fs::remove_dir_all(artifact_dir);
+    }
+
+    #[test]
+    fn artifact_lookup_searches_every_supplied_directory() {
+        let key_dir = temp_dir("keys_multi_dir");
+        let host = HostContext::collect();
+        let case = Case::new("Session", host.examiner.clone(), temp_dir("case_multi"));
+        case.save().unwrap();
+        let metadata_hash = case.metadata_sha256().unwrap();
+        let mut logger =
+            AuditLogger::new(case.case_directory.join("logs").join("audit.jsonl")).unwrap();
+        logger
+            .log(
+                case.id,
+                AuditAction::CaseCreated,
+                None,
+                None,
+                Some(metadata_hash),
+                AuditResult::Success,
+            )
+            .unwrap();
+
+        let first_dir = temp_dir("artifacts_a");
+        let second_dir = temp_dir("artifacts_b");
+        fs::create_dir_all(&first_dir).unwrap();
+        fs::create_dir_all(&second_dir).unwrap();
+        let first_path = first_dir.join("frame_a.png");
+        let second_path = second_dir.join("frame_b.png");
+        fs::write(&first_path, b"one").unwrap();
+        fs::write(&second_path, b"two").unwrap();
+        let first = ArtifactRecord::from_existing_file(&first_path, "RECOVERED_FRAME_PNG", "evidence").unwrap();
+        let second = ArtifactRecord::from_existing_file(&second_path, "RECOVERED_FRAME_PNG", "evidence").unwrap();
+        logger
+            .log_artifact(case.id, None, None, &first)
+            .unwrap();
+        logger
+            .log_artifact(case.id, None, None, &second)
+            .unwrap();
+
+        let identity = SigningIdentity::load_or_create_in(&key_dir).unwrap();
+        seal_case_with_identity(&mut logger, &case, &identity).unwrap();
+        drop(logger);
+
+        let public_key = identity.public_key_path();
+        verify_case_directories(
+            &case.case_directory,
+            &[first_dir.clone(), second_dir.clone()],
+            &public_key,
+        )
+        .unwrap();
+
+        let missing = verify_case_directories(&case.case_directory, &[first_dir.clone()], &public_key);
+        assert!(missing.is_err(), "a single directory cannot cover both artifacts");
+
+        let duplicate_dir = temp_dir("artifacts_dup");
+        fs::create_dir_all(&duplicate_dir).unwrap();
+        fs::write(duplicate_dir.join("frame_b.png"), b"other").unwrap();
+        let ambiguous = verify_case_directories(
+            &case.case_directory,
+            &[first_dir.clone(), second_dir.clone(), duplicate_dir.clone()],
+            &public_key,
+        )
+        .unwrap_err();
+        assert!(
+            ambiguous.contains("more than one file"),
+            "unexpected error: {ambiguous}"
+        );
+
+        let _ = fs::remove_dir_all(&case.case_directory);
+        let _ = fs::remove_dir_all(key_dir);
+        let _ = fs::remove_dir_all(first_dir);
+        let _ = fs::remove_dir_all(second_dir);
+        let _ = fs::remove_dir_all(duplicate_dir);
     }
 }
