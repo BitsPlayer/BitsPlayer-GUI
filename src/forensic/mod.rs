@@ -4,6 +4,7 @@ pub mod case;
 pub mod closure;
 pub mod context;
 pub mod evidence;
+pub mod evidence_copy;
 pub mod hashing;
 pub mod provenance;
 pub mod signing;
