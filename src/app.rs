@@ -9,6 +9,9 @@ use iced::{Element, Fill, Font, Size, Subscription, Task, Theme};
 use crate::analyze;
 
 use crate::extract;
+use crate::forensic::report::ForensicReport;
+use crate::forensic::report_manifest::ReportManifest;
+use crate::forensic::hashing::sha256_file;
 
 use crate::forensic::audit::{AuditAction, AuditLogger, AuditResult, EvidenceCopyContext, CopyAttemptContext};
 
@@ -122,6 +125,103 @@ let closed_entry = match logger.close_case(self.case.id, case_metadata_sha256) {
 
         };
 
+// Generate forensic reports after successful case closure.
+        match ForensicReport::generate(&self.case.case_directory) {
+
+            Ok(report) => {
+
+                if let Err(err) =
+                    report.save_json(&self.case.case_directory)
+                {
+
+                    eprintln!(
+                        "Failed to save forensic JSON report: {err}"
+                    );
+                }
+
+
+                if let Err(err) =
+                    report.save_html(&self.case.case_directory)
+                {
+
+                    eprintln!(
+                        "Failed to save forensic HTML report: {err}"
+                    );
+                }
+
+                match ReportManifest::create(
+
+                    &self.case.case_directory
+
+                ) {
+
+                    Ok(manifest) => {
+
+                        if let Err(err) =
+                            manifest.save(
+                                &self.case.case_directory
+                            )
+                        {
+                            eprintln!(
+                                "Failed to save report manifest: {err}"
+                            );
+                        }
+
+                    }
+
+
+                    Err(err) => {
+
+                        eprintln!(
+                            "Failed to create report manifest: {err}"
+                        );
+
+                    }
+                }
+
+            }
+
+
+            Err(err) => {
+
+                eprintln!(
+                    "Failed to generate forensic report: {err}"
+                );
+
+            }
+        }
+
+let report_manifest_path =
+
+            self.case.case_directory
+
+                .join("report_manifest.json");
+
+
+let report_manifest_sha256 =
+
+            if report_manifest_path.exists() {
+
+                match sha256_file(&report_manifest_path) {
+
+                    Ok(hash) => Some(hash),
+
+                    Err(err) => {
+
+                        eprintln!(
+                            "Failed to hash report manifest: {err}"
+                        );
+
+                        None
+                    }
+                }
+
+            } else {
+
+                None
+            };
+
+
 let closure = CaseClosure::new(
 
             self.case.id,
@@ -129,6 +229,8 @@ let closure = CaseClosure::new(
             closed_entry.sequence,
 
             closed_entry.entry_hash.clone(),
+
+            report_manifest_sha256.clone(),
 
         );
 
@@ -185,6 +287,8 @@ let signature = match signing_identity.sign_case(
             &closed_entry.entry_hash,
 
             &case_metadata_sha256,
+
+            report_manifest_sha256.as_deref(),
 
         ) {
 

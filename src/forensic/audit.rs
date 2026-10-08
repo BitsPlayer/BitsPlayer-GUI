@@ -234,10 +234,8 @@ struct AuditHashPayload<'a> {
 
     operation_context: Option<&'a OperationContext>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
     copy_context: Option<&'a EvidenceCopyContext>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
     copy_attempt_context: Option<&'a CopyAttemptContext>,
 
     previous_entry_hash: Option<&'a str>,
@@ -1169,7 +1167,12 @@ let payload = AuditHashPayload {
 
     };
 
-let bytes = serde_json::to_vec(&payload).map_err(io::Error::other)?;
+let debug_bytes =
+    serde_json::to_vec(&payload)
+        .map_err(io::Error::other)?;
+
+
+let bytes = debug_bytes;
 
 let mut hasher = Sha256::new();
 

@@ -26,7 +26,7 @@ use std::{
 
 use uuid::Uuid;
 
-pub const SIGNATURE_SCHEMA_VERSION: u32 = 1;
+pub const SIGNATURE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(
     Debug,
@@ -45,6 +45,8 @@ pub struct CaseSignature {
     pub final_head_hash: String,
     pub case_metadata_sha256: String,
 
+    pub report_manifest_sha256: Option<String>,
+
     pub public_key: String,
     pub signature: String,
 }
@@ -58,6 +60,8 @@ struct SignaturePayload<'a> {
 
     final_head_hash: &'a str,
     case_metadata_sha256: &'a str,
+
+    report_manifest_sha256: Option<&'a str>,
 }
 
 pub struct SigningIdentity {
@@ -169,6 +173,8 @@ impl SigningIdentity {
         final_head_hash: &str,
 
         case_metadata_sha256: &str,
+
+        report_manifest_sha256: Option<&str>,
     ) -> io::Result<CaseSignature> {
         let payload =
             SignaturePayload {
@@ -182,6 +188,8 @@ impl SigningIdentity {
                 final_head_hash,
 
                 case_metadata_sha256,
+
+                report_manifest_sha256,
             };
 
         let bytes =
@@ -223,6 +231,10 @@ impl SigningIdentity {
                 case_metadata_sha256:
                     case_metadata_sha256
                         .to_string(),
+
+                report_manifest_sha256:
+                    report_manifest_sha256
+                        .map(|v| v.to_string()),
 
                 public_key:
                     STANDARD.encode(
@@ -358,6 +370,10 @@ impl CaseSignature {
 
                 case_metadata_sha256:
                     &self.case_metadata_sha256,
+
+                report_manifest_sha256:
+                    self.report_manifest_sha256
+                        .as_deref(),
             };
 
         let bytes =

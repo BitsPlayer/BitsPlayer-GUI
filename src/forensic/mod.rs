@@ -8,3 +8,5 @@ pub mod evidence_copy;
 pub mod hashing;
 pub mod provenance;
 pub mod signing;
+pub mod report;
+pub mod report_manifest;
