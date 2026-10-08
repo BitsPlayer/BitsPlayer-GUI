@@ -10,7 +10,7 @@ use crate::analyze;
 
 use crate::extract;
 
-use crate::forensic::audit::{AuditAction, AuditLogger, AuditResult};
+use crate::forensic::audit::{AuditAction, AuditLogger, AuditResult, EvidenceCopyContext};
 
 use crate::forensic::case::Case;
 
@@ -306,7 +306,8 @@ let mut audit = match AuditLogger::new(&audit_path) {
 
         }
 
-        let mut analyze_state = analyze::State::default();
+let mut analyze_state = analyze::State::default();
+
         analyze_state.evidence_directory = Some(case.case_directory.join("evidence"));
 
         (
@@ -504,6 +505,35 @@ let Some(logger) = self.audit.as_mut() else {
                 return Task::none();
 
             };
+
+            // The copy was created and protected by Analyze before EvidenceReady.
+            // Never begin analysis without a signed copy relationship.
+            let Some(original) = self.analyze.original_path.as_ref() else {
+                self.analyze.busy = false;
+                self.analyze.error = Some("Missing original evidence path".into());
+                self.analyze.status = "Analysis blocked: source identity missing".into();
+                return Task::none();
+            };
+            if original == &evidence.path {
+                self.analyze.busy = false;
+                self.analyze.error = Some("Analysis would use original evidence".into());
+                self.analyze.status = "Analysis blocked: no working copy".into();
+                return Task::none();
+            }
+            let size = evidence.size_bytes;
+            let copy_context = EvidenceCopyContext {
+                original_path: original.to_string_lossy().into_owned(),
+                working_copy_path: evidence.path.to_string_lossy().into_owned(),
+                original_sha256: evidence.sha256.clone(),
+                working_copy_sha256: evidence.sha256.clone(),
+                size_bytes: size,
+            };
+            if let Err(err) = logger.log_evidence_copy(self.case.id, copy_context) {
+                self.analyze.busy = false;
+                self.analyze.error = Some(format!("Evidence-copy audit failed: {err}"));
+                self.analyze.status = "Analysis blocked: copy audit failure".into();
+                return Task::none();
+            }
 
             if let Err(err) = logger.log_with_context(
 
