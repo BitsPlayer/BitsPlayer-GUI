@@ -523,7 +523,15 @@ let Some(logger) = self.audit.as_mut() else {
             let size = evidence.size_bytes;
             let copy_context = EvidenceCopyContext {
                 original_path: original.to_string_lossy().into_owned(),
-                working_copy_path: evidence.path.to_string_lossy().into_owned(),
+                working_copy_path: match evidence.path.strip_prefix(&self.case.case_directory) {
+                    Ok(relative) => relative.to_string_lossy().into_owned(),
+                    Err(_) => {
+                        self.analyze.busy = false;
+                        self.analyze.error = Some("Working copy is outside this forensic case".into());
+                        self.analyze.status = "Analysis blocked: invalid working-copy location".into();
+                        return Task::none();
+                    }
+                },
                 original_sha256: evidence.sha256.clone(),
                 working_copy_sha256: evidence.sha256.clone(),
                 size_bytes: size,

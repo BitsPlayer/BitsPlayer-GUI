@@ -24,7 +24,7 @@ use std::{
 
 use uuid::Uuid;
 
-const AUDIT_SCHEMA_VERSION: u32 = 5;
+const AUDIT_SCHEMA_VERSION: u32 = 6;
 
 const CASE_SCHEMA_VERSION: u32 = 1;
 
@@ -1386,7 +1386,7 @@ let entry: AuditEntry = serde_json::from_str(&line).map_err(|error| {
 
         })?;
 
-        if entry.schema_version != 4 && entry.schema_version != 5 {
+        if entry.schema_version != 4 && entry.schema_version != 5 && entry.schema_version != 6 {
 
             return Err(format!(
 
@@ -1627,8 +1627,8 @@ fn verify_evidence_copies(
     case_directory: &Path,
     summary: &mut VerificationSummary,
 ) -> Result<(), String> {
-    let is_v5 = entries.first().is_some_and(|entry| entry.schema_version == 5);
-    if !is_v5 {
+    let schema = entries.first().map(|entry| entry.schema_version).unwrap_or(0);
+    if schema == 4 {
         summary.warning("legacy schema-4 case: no signed working-copy relationship");
         return Ok(());
     }
@@ -1659,18 +1659,39 @@ fn verify_evidence_copies(
         if entry.evidence_sha256.as_deref() != Some(copy.original_sha256.as_str()) {
             return Err("copy event evidence hash does not match source hash".into());
         }
-        let path = Path::new(&copy.working_copy_path);
-        let canonical_copy = fs::canonicalize(path)
+        let recorded = Path::new(&copy.working_copy_path);
+        let path = if schema == 6 {
+            use std::path::Component;
+            if recorded.is_absolute()
+                || recorded.components().any(|component| !matches!(component, Component::Normal(_)))
+                || recorded.components().count() != 2
+                || recorded.components().next() != Some(Component::Normal(std::ffi::OsStr::new("evidence")))
+            {
+                return Err(format!("unsafe schema-6 working-copy relative path: {}", recorded.display()));
+            }
+            canonical_case.join(recorded)
+        } else {
+            if !recorded.is_absolute() {
+                return Err(format!("schema-5 working-copy path must be absolute: {}", recorded.display()));
+            }
+            recorded.to_path_buf()
+        };
+        let file_type = fs::symlink_metadata(&path)
+            .map_err(|e| format!("working-copy metadata error: {e}"))?.file_type();
+        if file_type.is_symlink() || !file_type.is_file() {
+            return Err(format!("working copy must be a regular non-symlink file: {}", path.display()));
+        }
+        let canonical_copy = fs::canonicalize(&path)
             .map_err(|e| format!("missing working copy {}: {e}", path.display()))?;
         if canonical_copy.parent() != Some(evidence_dir.as_path()) {
             return Err(format!("working copy outside case evidence directory: {}", path.display()));
         }
-        let meta = fs::symlink_metadata(path)
+        let meta = fs::symlink_metadata(&path)
             .map_err(|e| format!("working-copy metadata error: {e}"))?;
         if !meta.is_file() || meta.file_type().is_symlink() || meta.len() != copy.size_bytes {
             return Err(format!("working-copy type/size mismatch: {}", path.display()));
         }
-        let actual = sha256_file(path).map_err(|e| format!("working-copy hash error: {e}"))?;
+        let actual = sha256_file(&path).map_err(|e| format!("working-copy hash error: {e}"))?;
         if actual != copy.working_copy_sha256 {
             return Err(format!("working-copy SHA-256 mismatch: {}", path.display()));
         }

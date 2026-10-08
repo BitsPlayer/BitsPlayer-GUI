@@ -24,7 +24,7 @@ use crate::forensic::context::{HostContext, OperationContext};
 
 use crate::forensic::provenance::BuildProvenance;
 
-pub const AUDIT_SCHEMA_VERSION: u32 = 5;
+pub const AUDIT_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 
@@ -856,7 +856,7 @@ let entry: AuditEntry = match serde_json::from_str(&line) {
 
         };
 
-        if entry.schema_version != 4 && entry.schema_version != 5 {
+        if entry.schema_version != 4 && entry.schema_version != 5 && entry.schema_version != 6 {
 
             return Ok(AuditVerification {
 
@@ -1432,11 +1432,41 @@ let mut logger = AuditLogger::new(&path).unwrap();
 
 let original = fs::read_to_string(&path).unwrap();
 
-let tampered = original.replace(
+let old_value = format!("\"schema_version\":{}", AUDIT_SCHEMA_VERSION);
 
-            "\"schema_version\":5",
+let new_value = format!(
 
-            "\"schema_version\":5,\"injected\":\"value\"",
+            "\"schema_version\":{},\"injected\":\"value\"",
+
+            AUDIT_SCHEMA_VERSION
+
+        );
+
+        assert!(
+
+            original.contains(&old_value),
+
+            "Expected schema version was not found in audit JSON"
+
+        );
+
+let tampered = original.replacen(
+
+            &old_value,
+
+            &new_value,
+
+            1,
+
+        );
+
+        assert_ne!(
+
+            original,
+
+            tampered,
+
+            "Tampering test did not modify the audit log"
 
         );
 
