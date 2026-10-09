@@ -2,7 +2,7 @@
 
 pub mod seal;
 
-pub use crate::application::verify;
+pub use crate::application::{report, verify};
 pub use crate::infrastructure::{
-    artifact, audit, case, closure, context, evidence, hashing, provenance, signing,
+    artifact, audit, case, closure, context, evidence, evidence_copy, hashing, provenance, signing,
 };

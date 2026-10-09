@@ -83,6 +83,7 @@ impl SigningIdentity {
         final_sequence: u64,
         final_head_hash: &str,
         case_metadata_sha256: &str,
+        report_manifest_sha256: &str,
     ) -> io::Result<CaseSignature> {
         let payload = SignaturePayload {
             schema_version: SIGNATURE_SCHEMA_VERSION,
@@ -90,6 +91,7 @@ impl SigningIdentity {
             final_sequence,
             final_head_hash,
             case_metadata_sha256,
+            report_manifest_sha256: Some(report_manifest_sha256),
         };
 
         let bytes = serde_json::to_vec(&payload).map_err(io::Error::other)?;
@@ -103,6 +105,7 @@ impl SigningIdentity {
             final_sequence,
             final_head_hash: final_head_hash.to_string(),
             case_metadata_sha256: case_metadata_sha256.to_string(),
+            report_manifest_sha256: Some(report_manifest_sha256.to_string()),
             public_key: STANDARD.encode(public_key.to_bytes()),
             signature: STANDARD.encode(signature.to_bytes()),
         })
@@ -298,7 +301,7 @@ mod tests {
         let directory = temp_dir("signing_verify");
         let identity = SigningIdentity::load_or_create_in(&directory).unwrap();
         let signature = identity
-            .sign_case(Uuid::new_v4(), 2, "head", "meta")
+            .sign_case(Uuid::new_v4(), 2, "head", "meta", "report")
             .unwrap();
 
         signature.verify(&identity.verifying_key()).unwrap();

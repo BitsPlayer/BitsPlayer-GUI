@@ -5,6 +5,8 @@ use std::time::Duration;
 use iced::window;
 use iced::{Element, Fill, Font, Size, Subscription, Task, Theme};
 
+use crate::application::evidence_copy::copy_evidence_for_analysis;
+use crate::infrastructure::adapters::FsEvidenceCopier;
 use crate::presentation::analyze;
 use crate::presentation::custody;
 use crate::presentation::extract::{self, SaveOutcome};
@@ -298,7 +300,50 @@ impl App {
         }
     }
 
+    fn spawn_evidence_copy(&self, source: PathBuf) -> Task<Message> {
+        let audit = Arc::clone(&self.audit);
+        let case_id = self.case.id;
+        let case_directory = self.case.case_directory.clone();
+        Task::perform(
+            async move {
+                match tokio::task::spawn_blocking(move || {
+                    let mut guard = audit.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let Some(logger) = guard.as_mut() else {
+                        return Err(String::from(
+                            "Forensic audit logger is unavailable. Analysis aborted.",
+                        ));
+                    };
+                    copy_evidence_for_analysis(
+                        logger,
+                        &FsEvidenceCopier,
+                        case_id,
+                        &case_directory,
+                        &source,
+                    )
+                    .map_err(|err| format!("Evidence copy failed: {err}"))
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(err) => Err(format!("Evidence copy task failed: {err}")),
+                }
+            },
+            |result| Message::Analyze(analyze::Message::CopyReady(result)),
+        )
+    }
+
     fn update_analyze(&mut self, msg: analyze::Message) -> Task<Message> {
+        if let analyze::Message::CopyRequested(source) = msg {
+            return self.spawn_evidence_copy(source);
+        }
+
+        if matches!(msg, analyze::Message::CopyReady(_)) {
+            let audit_path = self.case.case_directory.join("logs").join("audit.jsonl");
+            if let Ok(entries) = crate::forensic::audit::read_verified_audit(&audit_path, self.case.id) {
+                self.audit_entries = entries;
+            }
+        }
+
         let selecting = matches!(msg, analyze::Message::MapSelect(_));
 
         if let analyze::Message::EvidenceReady(Ok(ref evidence)) = msg {

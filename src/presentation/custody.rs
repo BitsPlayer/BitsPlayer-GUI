@@ -302,6 +302,9 @@ fn action_label(action: AuditAction) -> &'static str {
     match action {
         AuditAction::CaseCreated => "CASE_CREATED",
         AuditAction::CaseMetadataUpdated => "CASE_METADATA_UPDATED",
+        AuditAction::EvidenceCopyStarted => "EVIDENCE_COPY_STARTED",
+        AuditAction::EvidenceCopyCompleted => "EVIDENCE_COPY_COMPLETED",
+        AuditAction::EvidenceCopyFailed => "EVIDENCE_COPY_FAILED",
         AuditAction::EvidenceRegistered => "EVIDENCE_REGISTERED",
         AuditAction::AnalysisStarted => "ANALYSIS_STARTED",
         AuditAction::AnalysisCompleted => "ANALYSIS_COMPLETED",

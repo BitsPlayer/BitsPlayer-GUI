@@ -7,13 +7,16 @@ use uuid::Uuid;
 use crate::domain::context::{HostContext, OperationContext};
 use crate::domain::provenance::BuildProvenance;
 
-pub const AUDIT_SCHEMA_VERSION: u32 = 4;
+pub const AUDIT_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AuditAction {
     CaseCreated,
     CaseMetadataUpdated,
+    EvidenceCopyStarted,
+    EvidenceCopyCompleted,
+    EvidenceCopyFailed,
     EvidenceRegistered,
     AnalysisStarted,
     AnalysisCompleted,
@@ -24,6 +27,24 @@ pub enum AuditAction {
     ExtractFailed,
     ArtifactCreated,
     CaseClosed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceCopyContext {
+    pub original_path: String,
+    pub working_copy_path: String,
+    pub original_sha256: String,
+    pub working_copy_sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CopyAttemptContext {
+    pub source_path: String,
+    pub destination_path: String,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +84,11 @@ pub struct AuditEntry {
 
     pub host_context: HostContext,
     pub operation_context: Option<OperationContext>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_context: Option<EvidenceCopyContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_attempt_context: Option<CopyAttemptContext>,
 
     pub previous_entry_hash: Option<String>,
     pub entry_hash: String,
@@ -104,6 +130,11 @@ pub(crate) struct AuditHashPayload<'a> {
     host_context: &'a HostContext,
     operation_context: Option<&'a OperationContext>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copy_context: Option<&'a EvidenceCopyContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copy_attempt_context: Option<&'a CopyAttemptContext>,
+
     previous_entry_hash: Option<&'a str>,
 }
 
@@ -116,8 +147,9 @@ pub(crate) struct AuditFields<'a> {
     pub(crate) artifact_type: Option<&'a str>,
     pub(crate) artifact_size_bytes: Option<u64>,
     pub(crate) source_evidence_sha256: Option<&'a str>,
+    pub(crate) copy_context: Option<&'a EvidenceCopyContext>,
+    pub(crate) copy_attempt_context: Option<&'a CopyAttemptContext>,
 }
-
 
 pub(crate) fn hash_of_entry(entry: &AuditEntry) -> io::Result<String> {
     let provenance = BuildProvenance {
@@ -135,6 +167,8 @@ pub(crate) fn hash_of_entry(entry: &AuditEntry) -> io::Result<String> {
         artifact_type: entry.artifact_type.as_deref(),
         artifact_size_bytes: entry.artifact_size_bytes,
         source_evidence_sha256: entry.source_evidence_sha256.as_deref(),
+        copy_context: entry.copy_context.as_ref(),
+        copy_attempt_context: entry.copy_attempt_context.as_ref(),
     };
     calculate_entry_hash(
         entry.schema_version,
@@ -185,6 +219,8 @@ pub(crate) fn calculate_entry_hash(
         source_evidence_sha256: fields.source_evidence_sha256,
         host_context,
         operation_context,
+        copy_context: fields.copy_context,
+        copy_attempt_context: fields.copy_attempt_context,
         previous_entry_hash,
     };
 
@@ -193,4 +229,3 @@ pub(crate) fn calculate_entry_hash(
     hasher.update(bytes);
     Ok(hex::encode(hasher.finalize()))
 }
-

@@ -7,7 +7,8 @@ use anyhow::Result;
 use uuid::Uuid;
 
 use crate::domain::artifact::ArtifactRecord;
-use crate::domain::audit::AuditEntry;
+use crate::domain::audit::{AuditAction, AuditEntry, CopyAttemptContext, EvidenceCopyContext};
+use crate::domain::evidence::VerifiedCopy;
 use crate::domain::signing::{CaseSignature, IdentityOrigin};
 
 pub trait AuditLog {
@@ -18,6 +19,23 @@ pub trait AuditLog {
     ) -> io::Result<AuditEntry>;
 
     fn commit_prepared(&mut self, entry: &AuditEntry) -> io::Result<()>;
+
+    fn log_copy_attempt(
+        &mut self,
+        case_id: Uuid,
+        action: AuditAction,
+        context: CopyAttemptContext,
+    ) -> io::Result<AuditEntry>;
+
+    fn log_evidence_copy(
+        &mut self,
+        case_id: Uuid,
+        context: EvidenceCopyContext,
+    ) -> io::Result<AuditEntry>;
+}
+
+pub trait EvidenceCopier {
+    fn copy_verified(&self, source: &Path, destination: &Path) -> io::Result<VerifiedCopy>;
 }
 
 pub trait Signer {
@@ -29,6 +47,7 @@ pub trait Signer {
         final_sequence: u64,
         final_head_hash: &str,
         case_metadata_sha256: &str,
+        report_manifest_sha256: &str,
     ) -> io::Result<CaseSignature>;
 }
 

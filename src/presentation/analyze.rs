@@ -16,6 +16,7 @@ use iced::widget::{
 };
 use iced::{Element, Fill, Font, Task};
 
+use crate::domain::evidence::VerifiedCopy;
 use crate::forensic::evidence::{
     EvidenceRecord,
     IntegrityStatus,
@@ -33,6 +34,14 @@ use crate::presentation::widgets::hex_view;
 #[derive(Debug, Clone)]
 pub enum Message {
     Browse,
+
+    CopyRequested(
+        PathBuf,
+    ),
+
+    CopyReady(
+        Result<VerifiedCopy, String>,
+    ),
 
     /*
      * Evidence registration/hashing finishes first.
@@ -214,46 +223,98 @@ impl State {
 
                 self.status =
                     format!(
-                        "Registering evidence {}…",
+                        "Copying evidence {}…",
                         display_name(
                             &path,
                         )
                     );
 
-                Task::perform(
-                    async move {
-                        match tokio::task::spawn_blocking(
-                            move || {
-                                EvidenceRecord::from_path(
-                                    &path,
-                                )
-                                .map_err(
-                                    |e| {
-                                        format!(
-                                            "Evidence registration failed: {e}"
+                Task::done(
+                    Message::CopyRequested(
+                        path,
+                    ),
+                )
+            }
+
+            /*
+             * The App layer performs and audits the copy.
+             */
+            Message::CopyRequested(
+                _,
+            ) => {
+                Task::none()
+            }
+
+            Message::CopyReady(
+                result,
+            ) => {
+                match result {
+                    Ok(copy) => {
+                        let path =
+                            copy.copy_path;
+
+                        self.status =
+                            format!(
+                                "Registering evidence {}…",
+                                self.path
+                                    .as_deref()
+                                    .map(display_name)
+                                    .unwrap_or_default(),
+                            );
+
+                        Task::perform(
+                            async move {
+                                match tokio::task::spawn_blocking(
+                                    move || {
+                                        EvidenceRecord::from_path(
+                                            &path,
+                                        )
+                                        .map_err(
+                                            |e| {
+                                                format!(
+                                                    "Evidence registration failed: {e}"
+                                                )
+                                            },
                                         )
                                     },
                                 )
+                                .await
+                                {
+                                    Ok(result) => {
+                                        result
+                                    }
+
+                                    Err(e) => {
+                                        Err(
+                                            format!(
+                                                "Evidence registration task failed: {e}"
+                                            ),
+                                        )
+                                    }
+                                }
                             },
+
+                            Message::EvidenceReady,
                         )
-                        .await
-                        {
-                            Ok(result) => {
-                                result
-                            }
+                    }
 
-                            Err(e) => {
-                                Err(
-                                    format!(
-                                        "Evidence registration task failed: {e}"
-                                    ),
-                                )
-                            }
-                        }
-                    },
+                    Err(error) => {
+                        self.busy =
+                            false;
 
-                    Message::EvidenceReady,
-                )
+                        self.error =
+                            Some(
+                                error,
+                            );
+
+                        self.status =
+                            String::from(
+                                "Evidence copy failed",
+                            );
+
+                        Task::none()
+                    }
+                }
             }
 
             /*
@@ -296,6 +357,9 @@ impl State {
                             return Task::none();
                         };
 
+                        let analysis_path =
+                            evidence.path.clone();
+
                         /*
                          * Keep the registered evidence identity
                          * available immediately for the App/audit
@@ -337,7 +401,7 @@ impl State {
                                          */
                                         let analysis =
                                             bitplay::analyze(
-                                                &path,
+                                                &analysis_path,
                                             )
                                             .map_err(
                                                 |e| {
@@ -855,7 +919,9 @@ impl State {
             };
 
         let Some(path) =
-            self.path.clone()
+            self.evidence
+                .as_ref()
+                .map(|evidence| evidence.path.clone())
         else {
             self.hex =
                 HexPane::Failed {

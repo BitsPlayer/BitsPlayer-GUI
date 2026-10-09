@@ -1,11 +1,13 @@
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::domain::audit::{AuditAction, AuditEntry};
-use crate::domain::case::{Case, CASE_SCHEMA_VERSION};
-use crate::domain::closure::{CaseClosure, CLOSURE_SCHEMA_VERSION};
+use crate::domain::audit::{AuditAction, AuditEntry, AuditResult, CopyAttemptContext};
+use crate::domain::case::{CASE_SCHEMA_VERSION, Case};
+use crate::domain::closure::{CLOSURE_SCHEMA_VERSION, CaseClosure};
 use crate::domain::signing::{CaseSignature, SIGNATURE_SCHEMA_VERSION};
 use crate::infrastructure::audit::read_verified_audit;
 use crate::infrastructure::hashing::sha256_file;
+use crate::infrastructure::report::load_manifest;
 use crate::infrastructure::signing::load_verifying_key;
 
 #[derive(Debug, Clone, Default)]
@@ -80,8 +82,8 @@ pub fn verify_case_directories(
         case.schema_version
     ));
 
-    let actual_case_hash = sha256_file(&case_path)
-        .map_err(|error| format!("failed to hash case.json: {error}"))?;
+    let actual_case_hash =
+        sha256_file(&case_path).map_err(|error| format!("failed to hash case.json: {error}"))?;
     summary.ok(format!("case.json SHA-256 = {actual_case_hash}"));
 
     let entries = read_verified_audit(&audit_path, case.id)?;
@@ -100,6 +102,8 @@ pub fn verify_case_directories(
     summary.ok("first audit entry is CASE_CREATED");
 
     verify_operation_context(&case, &entries, &mut summary)?;
+    verify_copy_lifecycle(&entries, &mut summary)?;
+    verify_evidence_copies(&entries, case_directory, &mut summary)?;
 
     let created_case_hash = first_entry
         .case_metadata_sha256
@@ -111,9 +115,8 @@ pub fn verify_case_directories(
         .any(|entry| entry.action == AuditAction::CaseMetadataUpdated);
 
     if metadata_was_updated {
-        summary.warning(
-            "case metadata update exists; CASE_CREATED hash represents original metadata",
-        );
+        summary
+            .warning("case metadata update exists; CASE_CREATED hash represents original metadata");
     } else if created_case_hash != actual_case_hash {
         return Err(format!(
             "case.json hash mismatch: audit records {created_case_hash}, current file is {actual_case_hash}"
@@ -211,6 +214,7 @@ pub fn verify_case_directories(
         trusted_public_key,
         &mut summary,
     )?;
+    verify_report_bindings(case_directory, &closure, &case_signature, &mut summary)?;
 
     verify_artifact_entries(&entries, artifact_directories, &mut summary)?;
     verify_provenance(&entries, &mut summary)?;
@@ -270,7 +274,13 @@ fn verify_operation_context(
                         entry.action, entry.sequence
                     )
                 })?;
-                if context.evidence_path.as_deref().unwrap_or("").trim().is_empty() {
+                if context
+                    .evidence_path
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+                {
                     return Err(format!(
                         "{:?} sequence {} is missing evidence_path",
                         entry.action, entry.sequence
@@ -290,7 +300,13 @@ fn verify_operation_context(
                         entry.action, entry.sequence
                     )
                 })?;
-                if context.evidence_path.as_deref().unwrap_or("").trim().is_empty() {
+                if context
+                    .evidence_path
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+                {
                     return Err(format!(
                         "{:?} sequence {} is missing evidence_path",
                         entry.action, entry.sequence
@@ -311,7 +327,13 @@ fn verify_operation_context(
             }
             AuditAction::ArtifactCreated => {
                 if let Some(context) = entry.operation_context.as_ref() {
-                    if context.evidence_path.as_deref().unwrap_or("").trim().is_empty() {
+                    if context
+                        .evidence_path
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+                    {
                         return Err(format!(
                             "ARTIFACT_CREATED sequence {} contains an empty evidence_path",
                             entry.sequence
@@ -322,11 +344,258 @@ fn verify_operation_context(
             AuditAction::AnalysisFailed | AuditAction::ExtractFailed => {}
             AuditAction::CaseCreated
             | AuditAction::CaseMetadataUpdated
-            | AuditAction::CaseClosed => {}
+            | AuditAction::CaseClosed
+            | AuditAction::EvidenceCopyStarted
+            | AuditAction::EvidenceCopyCompleted
+            | AuditAction::EvidenceCopyFailed => {}
         }
     }
 
     summary.ok("operation context is structurally valid for analysis/extraction entries");
+    Ok(())
+}
+
+const EVIDENCE_DIRECTORY: &str = "evidence";
+
+fn is_evidence_relative_path(path: &str) -> bool {
+    match path.strip_prefix("evidence/") {
+        Some(name) => artifact_file_path(Path::new(EVIDENCE_DIRECTORY), name).is_ok(),
+        None => false,
+    }
+}
+
+fn verify_copy_lifecycle(
+    entries: &[AuditEntry],
+    summary: &mut VerificationReport,
+) -> Result<(), String> {
+    let mut pending: Option<&CopyAttemptContext> = None;
+    let mut copy_ready = false;
+
+    for entry in entries {
+        if entry.action != AuditAction::EvidenceCopyCompleted && entry.copy_context.is_some() {
+            return Err(format!(
+                "unexpected evidence copy context at sequence {}",
+                entry.sequence
+            ));
+        }
+        let is_copy_attempt = matches!(
+            entry.action,
+            AuditAction::EvidenceCopyStarted | AuditAction::EvidenceCopyFailed
+        );
+        if !is_copy_attempt && entry.copy_attempt_context.is_some() {
+            return Err(format!(
+                "unexpected copy attempt context at sequence {}",
+                entry.sequence
+            ));
+        }
+
+        match entry.action {
+            AuditAction::EvidenceCopyStarted => {
+                if pending.is_some() {
+                    return Err(format!(
+                        "overlapping evidence copy attempts at sequence {}",
+                        entry.sequence
+                    ));
+                }
+                let context = entry.copy_attempt_context.as_ref().ok_or_else(|| {
+                    format!(
+                        "EVIDENCE_COPY_STARTED sequence {} is missing copy attempt context",
+                        entry.sequence
+                    )
+                })?;
+                if entry.result != AuditResult::Started
+                    || context.error.is_some()
+                    || context.source_path.trim().is_empty()
+                    || !is_evidence_relative_path(&context.destination_path)
+                {
+                    return Err(format!(
+                        "invalid EVIDENCE_COPY_STARTED at sequence {}: destination must be evidence/<name>",
+                        entry.sequence
+                    ));
+                }
+                pending = Some(context);
+                copy_ready = false;
+            }
+            AuditAction::EvidenceCopyCompleted => {
+                let started = pending.take().ok_or_else(|| {
+                    format!(
+                        "EVIDENCE_COPY_COMPLETED without EVIDENCE_COPY_STARTED at sequence {}",
+                        entry.sequence
+                    )
+                })?;
+                let completed = entry.copy_context.as_ref().ok_or_else(|| {
+                    format!(
+                        "EVIDENCE_COPY_COMPLETED sequence {} is missing copy context",
+                        entry.sequence
+                    )
+                })?;
+                if entry.result != AuditResult::Success
+                    || started.source_path != completed.original_path
+                    || started.destination_path != completed.working_copy_path
+                {
+                    return Err(format!(
+                        "EVIDENCE_COPY_COMPLETED at sequence {} does not match its started attempt",
+                        entry.sequence
+                    ));
+                }
+                copy_ready = true;
+            }
+            AuditAction::EvidenceCopyFailed => {
+                let started = pending.take().ok_or_else(|| {
+                    format!(
+                        "EVIDENCE_COPY_FAILED without EVIDENCE_COPY_STARTED at sequence {}",
+                        entry.sequence
+                    )
+                })?;
+                let failed = entry.copy_attempt_context.as_ref().ok_or_else(|| {
+                    format!(
+                        "EVIDENCE_COPY_FAILED sequence {} is missing copy attempt context",
+                        entry.sequence
+                    )
+                })?;
+                if entry.result != AuditResult::Failed
+                    || started.source_path != failed.source_path
+                    || started.destination_path != failed.destination_path
+                    || failed
+                        .error
+                        .as_deref()
+                        .is_none_or(|error| error.trim().is_empty())
+                {
+                    return Err(format!(
+                        "EVIDENCE_COPY_FAILED at sequence {} does not match its started attempt",
+                        entry.sequence
+                    ));
+                }
+                copy_ready = false;
+            }
+            AuditAction::AnalysisStarted | AuditAction::EvidenceRegistered => {
+                if pending.is_some() || !copy_ready {
+                    return Err(format!(
+                        "{:?} at sequence {} requires a completed evidence copy",
+                        entry.action, entry.sequence
+                    ));
+                }
+            }
+            AuditAction::CaseClosed if pending.is_some() => {
+                return Err(format!(
+                    "case closed while an evidence copy is pending at sequence {}",
+                    entry.sequence
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if pending.is_some() {
+        return Err(String::from("unterminated evidence copy attempt"));
+    }
+    summary.ok("evidence copy lifecycle is consistent");
+    Ok(())
+}
+
+fn verify_evidence_copies(
+    entries: &[AuditEntry],
+    case_directory: &Path,
+    summary: &mut VerificationReport,
+) -> Result<(), String> {
+    let completed: Vec<&AuditEntry> = entries
+        .iter()
+        .filter(|entry| entry.action == AuditAction::EvidenceCopyCompleted)
+        .collect();
+    if completed.is_empty() {
+        summary.ok("no evidence working copies to verify");
+        return Ok(());
+    }
+
+    let canonical_case = fs::canonicalize(case_directory)
+        .map_err(|error| format!("cannot canonicalize case directory: {error}"))?;
+    let evidence_directory = canonical_case.join(EVIDENCE_DIRECTORY);
+
+    for entry in completed {
+        let copy = entry.copy_context.as_ref().ok_or_else(|| {
+            format!(
+                "EVIDENCE_COPY_COMPLETED sequence {} is missing copy context",
+                entry.sequence
+            )
+        })?;
+        if copy.original_path.trim().is_empty() {
+            return Err(format!(
+                "EVIDENCE_COPY_COMPLETED sequence {} has an empty original path",
+                entry.sequence
+            ));
+        }
+        let hash_is_valid = copy.original_sha256.len() == 64
+            && copy
+                .original_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit());
+        if !hash_is_valid || copy.original_sha256 != copy.working_copy_sha256 {
+            return Err(format!(
+                "invalid or mismatched source/working-copy SHA-256 at sequence {}",
+                entry.sequence
+            ));
+        }
+        if entry.evidence_sha256.as_deref() != Some(copy.original_sha256.as_str()) {
+            return Err(format!(
+                "EVIDENCE_COPY_COMPLETED sequence {} evidence hash does not match the source hash",
+                entry.sequence
+            ));
+        }
+        if !is_evidence_relative_path(&copy.working_copy_path) {
+            return Err(format!(
+                "working copy path must be evidence/<name>: {}",
+                copy.working_copy_path
+            ));
+        }
+
+        let path = case_directory.join(&copy.working_copy_path);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "working copy missing or unreadable {}: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "working copy must be a regular non-symlink file: {}",
+                path.display()
+            ));
+        }
+        let canonical_copy = fs::canonicalize(&path).map_err(|error| {
+            format!(
+                "working copy missing or unreadable {}: {error}",
+                path.display()
+            )
+        })?;
+        if canonical_copy.parent() != Some(evidence_directory.as_path()) {
+            return Err(format!(
+                "working copy is outside the case evidence directory: {}",
+                path.display()
+            ));
+        }
+        if metadata.len() != copy.size_bytes {
+            return Err(format!(
+                "working copy size mismatch for {}: audit={}, actual={}",
+                copy.working_copy_path,
+                copy.size_bytes,
+                metadata.len()
+            ));
+        }
+
+        let actual_hash = sha256_file(&path)
+            .map_err(|error| format!("failed to hash working copy {}: {error}", path.display()))?;
+        if actual_hash != copy.working_copy_sha256 {
+            return Err(format!(
+                "working copy SHA-256 mismatch for {}: audit={}, actual={actual_hash}",
+                copy.working_copy_path, copy.working_copy_sha256
+            ));
+        }
+        summary.ok(format!(
+            "evidence working copy verified: {}",
+            copy.working_copy_path
+        ));
+    }
+
     Ok(())
 }
 
@@ -400,6 +669,59 @@ fn verify_signature(
         .map_err(|error| format!("Ed25519 case signature verification failed: {error}"))?;
     summary.ok("embedded public key matches the trusted key");
     summary.ok("Ed25519 case signature is cryptographically valid");
+    Ok(())
+}
+
+fn verify_report_bindings(
+    case_directory: &Path,
+    closure: &CaseClosure,
+    signature_file: &CaseSignature,
+    summary: &mut VerificationReport,
+) -> Result<(), String> {
+    let closure_manifest_sha256 = closure
+        .report_manifest_sha256
+        .as_deref()
+        .ok_or_else(|| String::from("case_closure.json does not contain report_manifest_sha256"))?;
+    let signature_manifest_sha256 = signature_file
+        .report_manifest_sha256
+        .as_deref()
+        .ok_or_else(|| {
+            String::from("case_signature.json does not contain report_manifest_sha256")
+        })?;
+    if closure_manifest_sha256 != signature_manifest_sha256 {
+        return Err(format!(
+            "report manifest hash mismatch: closure={closure_manifest_sha256}, signature={signature_manifest_sha256}"
+        ));
+    }
+    summary.ok("closure and signature bind the same report manifest hash");
+
+    let manifest_path = case_directory.join("report_manifest.json");
+    let manifest_sha256 = sha256_file(&manifest_path)
+        .map_err(|error| format!("failed to hash report_manifest.json: {error}"))?;
+    if manifest_sha256 != closure_manifest_sha256 {
+        return Err(format!(
+            "report_manifest.json hash mismatch: expected {closure_manifest_sha256}, found {manifest_sha256}"
+        ));
+    }
+    summary.ok("report_manifest.json matches closure and signature");
+
+    let manifest = load_manifest(&manifest_path)
+        .map_err(|error| format!("invalid report_manifest.json: {error}"))?;
+
+    let report_files = [
+        ("report.json", &manifest.report_json_sha256),
+        ("report.html", &manifest.report_html_sha256),
+    ];
+    for (filename, expected) in report_files {
+        let actual = sha256_file(&case_directory.join(filename))
+            .map_err(|error| format!("failed to hash {filename}: {error}"))?;
+        if &actual != expected {
+            return Err(format!(
+                "{filename} hash mismatch: manifest={expected}, actual={actual}"
+            ));
+        }
+        summary.ok(format!("{filename} matches report_manifest.json"));
+    }
     Ok(())
 }
 
@@ -552,7 +874,10 @@ fn verify_artifact_entries(
             format!("artifact missing or unreadable {}: {error}", path.display())
         })?;
         if !metadata.is_file() {
-            return Err(format!("artifact is not a regular file: {}", path.display()));
+            return Err(format!(
+                "artifact is not a regular file: {}",
+                path.display()
+            ));
         }
         if metadata.len() != expected_size {
             return Err(format!(
@@ -607,9 +932,11 @@ mod tests {
     use super::*;
     use crate::application::seal::seal_case_with_identity;
     use crate::domain::artifact::ArtifactRecord;
+    use crate::domain::audit::EvidenceCopyContext;
     use crate::domain::audit::{AuditAction, AuditResult};
     use crate::domain::context::HostContext;
     use crate::infrastructure::audit::AuditLogger;
+    use crate::infrastructure::evidence_copy::create_verified_copy;
     use crate::infrastructure::signing::SigningIdentity;
     use chrono::Utc;
     use std::{
@@ -631,7 +958,8 @@ mod tests {
         let case = Case::new("Session", host.examiner.clone(), case_dir);
         case.save().unwrap();
         let hash = case.metadata_sha256().unwrap();
-        let mut logger = AuditLogger::new(case.case_directory.join("logs").join("audit.jsonl")).unwrap();
+        let mut logger =
+            AuditLogger::new(case.case_directory.join("logs").join("audit.jsonl")).unwrap();
         logger
             .log(
                 case.id,
@@ -692,6 +1020,93 @@ mod tests {
     }
 
     #[test]
+    fn sealed_report_files_are_bound_to_the_seal() {
+        let key_dir = temp_dir("keys_report");
+        let (case, identity) = seal_empty_case(&key_dir);
+        let public_key = identity.public_key_path();
+
+        let report = verify_case(&case.case_directory, None, &public_key).unwrap();
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check == "report.html matches report_manifest.json")
+        );
+        assert!(case.case_directory.join("report.json").is_file());
+        assert!(case.case_directory.join("report.html").is_file());
+        assert!(case.case_directory.join("report_manifest.json").is_file());
+
+        let _ = fs::remove_dir_all(&case.case_directory);
+        let _ = fs::remove_dir_all(key_dir);
+    }
+
+    #[test]
+    fn tampered_report_files_fail_verification() {
+        let key_dir = temp_dir("keys_report_tamper");
+        let (case, identity) = seal_empty_case(&key_dir);
+        let public_key = identity.public_key_path();
+
+        let html_path = case.case_directory.join("report.html");
+        let original_html = fs::read(&html_path).unwrap();
+        fs::write(&html_path, b"<html>edited</html>").unwrap();
+        assert!(verify_case(&case.case_directory, None, &public_key).is_err());
+        fs::write(&html_path, original_html).unwrap();
+        verify_case(&case.case_directory, None, &public_key).unwrap();
+
+        let json_path = case.case_directory.join("report.json");
+        let original_json = fs::read(&json_path).unwrap();
+        fs::write(&json_path, b"{}").unwrap();
+        assert!(verify_case(&case.case_directory, None, &public_key).is_err());
+        fs::write(&json_path, original_json).unwrap();
+
+        let manifest_path = case.case_directory.join("report_manifest.json");
+        let original_manifest = fs::read(&manifest_path).unwrap();
+        fs::write(&manifest_path, b"{}").unwrap();
+        assert!(verify_case(&case.case_directory, None, &public_key).is_err());
+        fs::write(&manifest_path, original_manifest).unwrap();
+        verify_case(&case.case_directory, None, &public_key).unwrap();
+
+        let _ = fs::remove_dir_all(&case.case_directory);
+        let _ = fs::remove_dir_all(key_dir);
+    }
+
+    #[test]
+    fn closure_and_signature_must_bind_the_same_report_manifest() {
+        let key_dir = temp_dir("keys_report_binding");
+        let (case, identity) = seal_empty_case(&key_dir);
+        let public_key = identity.public_key_path();
+
+        let closure_path = case.case_directory.join("case_closure.json");
+        let mut closure = CaseClosure::load(&closure_path).unwrap();
+        closure.report_manifest_sha256 = None;
+        fs::remove_file(&closure_path).unwrap();
+        closure.save(&case.case_directory).unwrap();
+        assert!(verify_case(&case.case_directory, None, &public_key).is_err());
+
+        let _ = fs::remove_dir_all(&case.case_directory);
+        let _ = fs::remove_dir_all(key_dir);
+    }
+
+    #[test]
+    fn second_seal_does_not_remove_existing_report_files() {
+        let key_dir = temp_dir("keys_reseal");
+        let (case, identity) = seal_empty_case(&key_dir);
+        let public_key = identity.public_key_path();
+
+        let mut logger =
+            AuditLogger::new(case.case_directory.join("logs").join("audit.jsonl")).unwrap();
+        assert!(seal_case_with_identity(&mut logger, &case, &identity).is_err());
+        drop(logger);
+
+        assert!(case.case_directory.join("report.json").is_file());
+        assert!(case.case_directory.join("report_manifest.json").is_file());
+        verify_case(&case.case_directory, None, &public_key).unwrap();
+
+        let _ = fs::remove_dir_all(&case.case_directory);
+        let _ = fs::remove_dir_all(key_dir);
+    }
+
+    #[test]
     fn artifact_names_cannot_escape_the_artifact_directory() {
         let key_dir = temp_dir("keys_artifact");
         let host = HostContext::collect();
@@ -720,9 +1135,7 @@ mod tests {
             source_evidence_sha256: String::from("def"),
             created_at: Utc::now(),
         };
-        logger
-            .log_artifact(case.id, None, None, &artifact)
-            .unwrap();
+        logger.log_artifact(case.id, None, None, &artifact).unwrap();
 
         let identity = SigningIdentity::load_or_create_in(&key_dir).unwrap();
         seal_case_with_identity(&mut logger, &case, &identity).unwrap();
@@ -772,10 +1185,16 @@ mod tests {
         fs::create_dir_all(&artifact_dir).unwrap();
         let artifact_path = artifact_dir.join("frame.png");
         fs::write(&artifact_path, b"png").unwrap();
-        let artifact = ArtifactRecord::from_existing_file(&artifact_path, "RECOVERED_FRAME_PNG", "evidence")
-            .unwrap();
+        let artifact =
+            ArtifactRecord::from_existing_file(&artifact_path, "RECOVERED_FRAME_PNG", "evidence")
+                .unwrap();
         logger
-            .log_artifact(case.id, Some(String::from("clip.mp4")), Some(String::from("evidence")), &artifact)
+            .log_artifact(
+                case.id,
+                Some(String::from("clip.mp4")),
+                Some(String::from("evidence")),
+                &artifact,
+            )
             .unwrap();
 
         let identity = SigningIdentity::load_or_create_in(&key_dir).unwrap();
@@ -824,14 +1243,14 @@ mod tests {
         let second_path = second_dir.join("frame_b.png");
         fs::write(&first_path, b"one").unwrap();
         fs::write(&second_path, b"two").unwrap();
-        let first = ArtifactRecord::from_existing_file(&first_path, "RECOVERED_FRAME_PNG", "evidence").unwrap();
-        let second = ArtifactRecord::from_existing_file(&second_path, "RECOVERED_FRAME_PNG", "evidence").unwrap();
-        logger
-            .log_artifact(case.id, None, None, &first)
-            .unwrap();
-        logger
-            .log_artifact(case.id, None, None, &second)
-            .unwrap();
+        let first =
+            ArtifactRecord::from_existing_file(&first_path, "RECOVERED_FRAME_PNG", "evidence")
+                .unwrap();
+        let second =
+            ArtifactRecord::from_existing_file(&second_path, "RECOVERED_FRAME_PNG", "evidence")
+                .unwrap();
+        logger.log_artifact(case.id, None, None, &first).unwrap();
+        logger.log_artifact(case.id, None, None, &second).unwrap();
 
         let identity = SigningIdentity::load_or_create_in(&key_dir).unwrap();
         seal_case_with_identity(&mut logger, &case, &identity).unwrap();
@@ -845,8 +1264,12 @@ mod tests {
         )
         .unwrap();
 
-        let missing = verify_case_directories(&case.case_directory, &[first_dir.clone()], &public_key);
-        assert!(missing.is_err(), "a single directory cannot cover both artifacts");
+        let missing =
+            verify_case_directories(&case.case_directory, &[first_dir.clone()], &public_key);
+        assert!(
+            missing.is_err(),
+            "a single directory cannot cover both artifacts"
+        );
 
         let duplicate_dir = temp_dir("artifacts_dup");
         fs::create_dir_all(&duplicate_dir).unwrap();
@@ -867,5 +1290,220 @@ mod tests {
         let _ = fs::remove_dir_all(first_dir);
         let _ = fs::remove_dir_all(second_dir);
         let _ = fs::remove_dir_all(duplicate_dir);
+    }
+
+    fn copy_attempt(destination: &str, error: Option<&str>) -> CopyAttemptContext {
+        CopyAttemptContext {
+            source_path: String::from("/evidence/source.mp4"),
+            destination_path: destination.to_string(),
+            error: error.map(str::to_string),
+        }
+    }
+
+    fn audit_entries(
+        name: &str,
+        steps: impl FnOnce(&mut AuditLogger, uuid::Uuid),
+    ) -> Vec<AuditEntry> {
+        let dir = temp_dir(name);
+        fs::create_dir_all(&dir).unwrap();
+        let audit_path = dir.join("audit.jsonl");
+        let case_id = uuid::Uuid::new_v4();
+        let mut logger = AuditLogger::new(&audit_path).unwrap();
+        steps(&mut logger, case_id);
+        drop(logger);
+        let entries = read_verified_audit(&audit_path, case_id).unwrap();
+        let _ = fs::remove_dir_all(dir);
+        entries
+    }
+
+    #[test]
+    fn copy_lifecycle_allows_registration_only_after_a_completed_copy() {
+        let entries = audit_entries("copy_lifecycle_ok", |logger, case_id| {
+            logger
+                .log_copy_attempt(
+                    case_id,
+                    AuditAction::EvidenceCopyStarted,
+                    copy_attempt("evidence/working-1.mp4", None),
+                )
+                .unwrap();
+            logger
+                .log_evidence_copy(
+                    case_id,
+                    EvidenceCopyContext {
+                        original_path: String::from("/evidence/source.mp4"),
+                        working_copy_path: String::from("evidence/working-1.mp4"),
+                        original_sha256: "a".repeat(64),
+                        working_copy_sha256: "a".repeat(64),
+                        size_bytes: 3,
+                    },
+                )
+                .unwrap();
+            logger
+                .log(
+                    case_id,
+                    AuditAction::EvidenceRegistered,
+                    None,
+                    None,
+                    None,
+                    AuditResult::Success,
+                )
+                .unwrap();
+        });
+        let mut summary = VerificationReport::default();
+        verify_copy_lifecycle(&entries, &mut summary).unwrap();
+    }
+
+    #[test]
+    fn copy_lifecycle_rejects_registration_without_a_copy() {
+        let entries = audit_entries("copy_lifecycle_none", |logger, case_id| {
+            logger
+                .log(
+                    case_id,
+                    AuditAction::EvidenceRegistered,
+                    None,
+                    None,
+                    None,
+                    AuditResult::Success,
+                )
+                .unwrap();
+        });
+        let mut summary = VerificationReport::default();
+        let error = verify_copy_lifecycle(&entries, &mut summary).unwrap_err();
+        assert!(
+            error.contains("requires a completed evidence copy"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn copy_lifecycle_rejects_analysis_after_a_failed_copy() {
+        let entries = audit_entries("copy_lifecycle_failed", |logger, case_id| {
+            logger
+                .log_copy_attempt(
+                    case_id,
+                    AuditAction::EvidenceCopyStarted,
+                    copy_attempt("evidence/working-1.mp4", None),
+                )
+                .unwrap();
+            logger
+                .log_copy_attempt(
+                    case_id,
+                    AuditAction::EvidenceCopyFailed,
+                    copy_attempt("evidence/working-1.mp4", Some("disk full")),
+                )
+                .unwrap();
+            logger
+                .log(
+                    case_id,
+                    AuditAction::AnalysisStarted,
+                    None,
+                    None,
+                    None,
+                    AuditResult::Started,
+                )
+                .unwrap();
+        });
+        let mut summary = VerificationReport::default();
+        let error = verify_copy_lifecycle(&entries, &mut summary).unwrap_err();
+        assert!(
+            error.contains("requires a completed evidence copy"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn copy_lifecycle_rejects_overlapping_and_unterminated_attempts() {
+        let overlapping = audit_entries("copy_lifecycle_overlap", |logger, case_id| {
+            for _ in 0..2 {
+                logger
+                    .log_copy_attempt(
+                        case_id,
+                        AuditAction::EvidenceCopyStarted,
+                        copy_attempt("evidence/working-1.mp4", None),
+                    )
+                    .unwrap();
+            }
+        });
+        let mut summary = VerificationReport::default();
+        let error = verify_copy_lifecycle(&overlapping, &mut summary).unwrap_err();
+        assert!(error.contains("overlapping"), "unexpected error: {error}");
+
+        let unterminated = audit_entries("copy_lifecycle_unterminated", |logger, case_id| {
+            logger
+                .log_copy_attempt(
+                    case_id,
+                    AuditAction::EvidenceCopyStarted,
+                    copy_attempt("evidence/working-1.mp4", None),
+                )
+                .unwrap();
+        });
+        let error = verify_copy_lifecycle(&unterminated, &mut summary).unwrap_err();
+        assert!(error.contains("unterminated"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn copy_destination_must_be_a_single_name_inside_evidence() {
+        let entries = audit_entries("copy_lifecycle_escape", |logger, case_id| {
+            logger
+                .log_copy_attempt(
+                    case_id,
+                    AuditAction::EvidenceCopyStarted,
+                    copy_attempt("../escape.mp4", None),
+                )
+                .unwrap();
+        });
+        let mut summary = VerificationReport::default();
+        let error = verify_copy_lifecycle(&entries, &mut summary).unwrap_err();
+        assert!(
+            error.contains("destination must be evidence/<name>"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn evidence_working_copy_must_match_the_audit() {
+        let case_dir = temp_dir("evidence_copy_verify");
+        let evidence_dir = case_dir.join("evidence");
+        fs::create_dir_all(&evidence_dir).unwrap();
+        let source = case_dir.join("input.mp4");
+        fs::write(&source, b"evidence bytes").unwrap();
+        let working = evidence_dir.join("working-1.mp4");
+        let copy = create_verified_copy(&source, &working).unwrap();
+
+        let entries = audit_entries("evidence_copy_audit", |logger, case_id| {
+            logger
+                .log_evidence_copy(
+                    case_id,
+                    EvidenceCopyContext {
+                        original_path: source.to_string_lossy().into_owned(),
+                        working_copy_path: String::from("evidence/working-1.mp4"),
+                        original_sha256: copy.sha256.clone(),
+                        working_copy_sha256: copy.sha256.clone(),
+                        size_bytes: copy.size_bytes,
+                    },
+                )
+                .unwrap();
+        });
+
+        let mut summary = VerificationReport::default();
+        verify_evidence_copies(&entries, &case_dir, &mut summary).unwrap();
+
+        let mut permissions = fs::metadata(&working).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o600);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        fs::set_permissions(&working, permissions).unwrap();
+        fs::write(&working, b"evidence BYTES").unwrap();
+        let error = verify_evidence_copies(&entries, &case_dir, &mut summary).unwrap_err();
+        assert!(
+            error.contains("SHA-256 mismatch"),
+            "unexpected error: {error}"
+        );
+
+        let _ = fs::remove_dir_all(case_dir);
     }
 }

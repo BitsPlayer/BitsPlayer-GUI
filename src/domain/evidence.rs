@@ -26,3 +26,11 @@ pub struct EvidenceRecord {
     pub inode: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct VerifiedCopy {
+    pub source_path: PathBuf,
+    pub copy_path: PathBuf,
+    pub size_bytes: u64,
+    /// SHA-256 of the source bytes read during the copy; the working copy was verified to match it.
+    pub sha256: String,
+}

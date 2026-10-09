@@ -3,7 +3,10 @@
 pub mod analyze;
 pub mod app;
 pub mod custody;
+pub mod export_cli;
+pub mod export_verify_cli;
 pub mod extract;
+pub mod report_cli;
 pub mod theme;
 pub mod verify_cli;
 pub mod widgets;

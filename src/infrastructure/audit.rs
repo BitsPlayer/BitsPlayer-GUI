@@ -7,13 +7,20 @@ use std::{
 };
 use uuid::Uuid;
 
-use crate::domain::audit::{calculate_entry_hash, hash_of_entry, AuditFields};
 use crate::domain::artifact::ArtifactRecord;
+pub use crate::domain::audit::{
+    AUDIT_SCHEMA_VERSION, AuditAction, AuditEntry, AuditResult, AuditVerification,
+    CopyAttemptContext, EvidenceCopyContext,
+};
+use crate::domain::audit::{AuditFields, calculate_entry_hash, hash_of_entry};
 use crate::domain::context::{HostContext, OperationContext};
 use crate::domain::provenance::BuildProvenance;
-pub use crate::domain::audit::{
-    AuditAction, AuditEntry, AuditResult, AuditVerification, AUDIT_SCHEMA_VERSION,
-};
+
+#[derive(Default)]
+struct CopyContexts {
+    copy: Option<EvidenceCopyContext>,
+    attempt: Option<CopyAttemptContext>,
+}
 
 #[derive(Debug)]
 pub struct AuditLogger {
@@ -59,9 +66,9 @@ impl AuditLogger {
         };
 
         if !verification.valid {
-            let message = verification.error.unwrap_or_else(|| {
-                String::from("existing audit log failed verification")
-            });
+            let message = verification
+                .error
+                .unwrap_or_else(|| String::from("existing audit log failed verification"));
             let _ = FileExt::unlock(&file);
             return Err(io::Error::new(io::ErrorKind::InvalidData, message));
         }
@@ -111,6 +118,7 @@ impl AuditLogger {
             None,
             None,
             None,
+            CopyContexts::default(),
         )
     }
 
@@ -137,6 +145,7 @@ impl AuditLogger {
             None,
             None,
             Some(operation_context),
+            CopyContexts::default(),
         )
     }
 
@@ -147,13 +156,7 @@ impl AuditLogger {
         evidence_sha256: Option<String>,
         artifact: &ArtifactRecord,
     ) -> io::Result<AuditEntry> {
-        self.log_artifact_with_context(
-            case_id,
-            evidence_filename,
-            evidence_sha256,
-            artifact,
-            None,
-        )
+        self.log_artifact_with_context(case_id, evidence_filename, evidence_sha256, artifact, None)
     }
 
     pub fn log_artifact_with_context(
@@ -177,6 +180,74 @@ impl AuditLogger {
             Some(artifact.size_bytes),
             Some(artifact.source_evidence_sha256.clone()),
             operation_context,
+            CopyContexts::default(),
+        )
+    }
+
+    pub fn log_evidence_copy(
+        &mut self,
+        case_id: Uuid,
+        context: EvidenceCopyContext,
+    ) -> io::Result<AuditEntry> {
+        let evidence_filename = Path::new(&context.original_path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        let evidence_sha256 = Some(context.original_sha256.clone());
+        self.log_internal(
+            case_id,
+            AuditAction::EvidenceCopyCompleted,
+            AuditResult::Success,
+            evidence_filename,
+            evidence_sha256,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            CopyContexts {
+                copy: Some(context),
+                attempt: None,
+            },
+        )
+    }
+
+    pub fn log_copy_attempt(
+        &mut self,
+        case_id: Uuid,
+        action: AuditAction,
+        context: CopyAttemptContext,
+    ) -> io::Result<AuditEntry> {
+        let result = match (action, context.error.as_deref()) {
+            (AuditAction::EvidenceCopyStarted, None) => AuditResult::Started,
+            (AuditAction::EvidenceCopyFailed, Some(error)) if !error.trim().is_empty() => {
+                AuditResult::Failed
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid copy attempt action or error",
+                ));
+            }
+        };
+        self.log_internal(
+            case_id,
+            action,
+            result,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            CopyContexts {
+                copy: None,
+                attempt: Some(context),
+            },
         )
     }
 
@@ -194,6 +265,7 @@ impl AuditLogger {
         artifact_size_bytes: Option<u64>,
         source_evidence_sha256: Option<String>,
         operation_context: Option<OperationContext>,
+        copy_contexts: CopyContexts,
     ) -> io::Result<AuditEntry> {
         let entry = self.build_entry(
             case_id,
@@ -208,6 +280,7 @@ impl AuditLogger {
             artifact_size_bytes,
             source_evidence_sha256,
             operation_context,
+            copy_contexts,
         )?;
         self.commit_entry(&entry)?;
         Ok(entry)
@@ -227,6 +300,7 @@ impl AuditLogger {
         artifact_size_bytes: Option<u64>,
         source_evidence_sha256: Option<String>,
         operation_context: Option<OperationContext>,
+        copy_contexts: CopyContexts,
     ) -> io::Result<AuditEntry> {
         let timestamp = Utc::now();
         let sequence = self.next_sequence;
@@ -241,6 +315,8 @@ impl AuditLogger {
             artifact_type: artifact_type.as_deref(),
             artifact_size_bytes,
             source_evidence_sha256: source_evidence_sha256.as_deref(),
+            copy_context: copy_contexts.copy.as_ref(),
+            copy_attempt_context: copy_contexts.attempt.as_ref(),
         };
 
         let entry_hash = calculate_entry_hash(
@@ -278,6 +354,8 @@ impl AuditLogger {
             source_evidence_sha256,
             host_context: self.host_context.clone(),
             operation_context,
+            copy_context: copy_contexts.copy,
+            copy_attempt_context: copy_contexts.attempt,
             previous_entry_hash,
             entry_hash,
         })
@@ -319,6 +397,7 @@ impl AuditLogger {
             None,
             None,
             None,
+            CopyContexts::default(),
         )
     }
 
@@ -406,11 +485,7 @@ pub fn verify_audit_log(path: impl AsRef<Path>) -> io::Result<AuditVerification>
                     entries_checked,
                     last_hash: expected_previous_hash,
                     last_sequence,
-                    error: Some(format!(
-                        "invalid audit JSON at line {}: {}",
-                        index + 1,
-                        err
-                    )),
+                    error: Some(format!("invalid audit JSON at line {}: {}", index + 1, err)),
                 });
             }
         };
@@ -479,10 +554,7 @@ pub fn verify_audit_log(path: impl AsRef<Path>) -> io::Result<AuditVerification>
                 entries_checked,
                 last_hash: expected_previous_hash,
                 last_sequence,
-                error: Some(format!(
-                    "audit entry hash mismatch at line {}",
-                    index + 1
-                )),
+                error: Some(format!("audit entry hash mismatch at line {}", index + 1)),
             });
         }
 
@@ -507,9 +579,8 @@ pub fn read_verified_audit(
     expected_case_id: Uuid,
 ) -> Result<Vec<AuditEntry>, String> {
     let path = path.as_ref();
-    let file = File::open(path).map_err(|error| {
-        format!("failed to open {}: {error}", path.display())
-    })?;
+    let file =
+        File::open(path).map_err(|error| format!("failed to open {}: {error}", path.display()))?;
     let reader = BufReader::new(file);
 
     let mut entries = Vec::new();
@@ -517,16 +588,14 @@ pub fn read_verified_audit(
     let mut expected_sequence = 1u64;
 
     for (index, line) in reader.lines().enumerate() {
-        let line = line.map_err(|error| {
-            format!("failed reading audit line {}: {error}", index + 1)
-        })?;
+        let line =
+            line.map_err(|error| format!("failed reading audit line {}: {error}", index + 1))?;
         if line.trim().is_empty() {
             continue;
         }
 
-        let entry: AuditEntry = serde_json::from_str(&line).map_err(|error| {
-            format!("invalid audit JSON at line {}: {error}", index + 1)
-        })?;
+        let entry: AuditEntry = serde_json::from_str(&line)
+            .map_err(|error| format!("invalid audit JSON at line {}: {error}", index + 1))?;
 
         if entry.schema_version != AUDIT_SCHEMA_VERSION {
             return Err(format!(
@@ -562,8 +631,9 @@ pub fn read_verified_audit(
             ));
         }
 
-        let calculated_hash = hash_of_entry(&entry)
-            .map_err(|error| format!("failed to hash audit entry at line {}: {error}", index + 1))?;
+        let calculated_hash = hash_of_entry(&entry).map_err(|error| {
+            format!("failed to hash audit entry at line {}: {error}", index + 1)
+        })?;
         if calculated_hash != entry.entry_hash {
             return Err(format!(
                 "audit entry hash mismatch at line {}: stored={}, calculated={}",
@@ -760,10 +830,8 @@ mod tests {
         }
 
         let original = fs::read_to_string(&path).unwrap();
-        let tampered = original.replace(
-            "\"schema_version\":4",
-            "\"schema_version\":4,\"injected\":\"value\"",
-        );
+        let schema = format!("\"schema_version\":{AUDIT_SCHEMA_VERSION}");
+        let tampered = original.replace(&schema, &format!("{schema},\"injected\":\"value\""));
         fs::write(&path, tampered).unwrap();
 
         assert!(!verify_audit_log(&path).unwrap().valid);
@@ -902,5 +970,4 @@ mod tests {
         assert!(verify_audit_log(&path).unwrap().valid);
         fs::remove_file(path).unwrap();
     }
-
 }

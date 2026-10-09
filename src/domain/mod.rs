@@ -7,4 +7,5 @@ pub mod closure;
 pub mod context;
 pub mod evidence;
 pub mod provenance;
+pub mod report;
 pub mod signing;

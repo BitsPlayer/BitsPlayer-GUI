@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use uuid::Uuid;
 
-pub const SIGNATURE_SCHEMA_VERSION: u32 = 1;
+pub const SIGNATURE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityOrigin {
@@ -21,6 +21,7 @@ pub struct CaseSignature {
     pub final_sequence: u64,
     pub final_head_hash: String,
     pub case_metadata_sha256: String,
+    pub report_manifest_sha256: Option<String>,
     pub public_key: String,
     pub signature: String,
 }
@@ -32,6 +33,7 @@ pub(crate) struct SignaturePayload<'a> {
     pub(crate) final_sequence: u64,
     pub(crate) final_head_hash: &'a str,
     pub(crate) case_metadata_sha256: &'a str,
+    pub(crate) report_manifest_sha256: Option<&'a str>,
 }
 
 
@@ -71,6 +73,7 @@ impl CaseSignature {
             final_sequence: self.final_sequence,
             final_head_hash: &self.final_head_hash,
             case_metadata_sha256: &self.case_metadata_sha256,
+            report_manifest_sha256: self.report_manifest_sha256.as_deref(),
         };
         let bytes = serde_json::to_vec(&payload).map_err(io::Error::other)?;
 

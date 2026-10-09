@@ -7,11 +7,13 @@ use anyhow::Result;
 use uuid::Uuid;
 
 use crate::application::ports::{
-    ArtifactWriter, AuditLog, CaseStore, FrameExtractor, Hasher, LayoutAnalyzer, Signer,
+    ArtifactWriter, AuditLog, CaseStore, EvidenceCopier, FrameExtractor, Hasher, LayoutAnalyzer,
+    Signer,
 };
 use crate::domain::artifact::ArtifactRecord;
-use crate::domain::audit::AuditEntry;
+use crate::domain::audit::{AuditAction, AuditEntry, CopyAttemptContext, EvidenceCopyContext};
 use crate::domain::case::Case;
+use crate::domain::evidence::VerifiedCopy;
 use crate::domain::signing::{CaseSignature, IdentityOrigin};
 use crate::infrastructure::audit::AuditLogger;
 use crate::infrastructure::signing::SigningIdentity;
@@ -27,6 +29,31 @@ impl AuditLog for AuditLogger {
 
     fn commit_prepared(&mut self, entry: &AuditEntry) -> io::Result<()> {
         AuditLogger::commit_prepared(self, entry)
+    }
+
+    fn log_copy_attempt(
+        &mut self,
+        case_id: Uuid,
+        action: AuditAction,
+        context: CopyAttemptContext,
+    ) -> io::Result<AuditEntry> {
+        AuditLogger::log_copy_attempt(self, case_id, action, context)
+    }
+
+    fn log_evidence_copy(
+        &mut self,
+        case_id: Uuid,
+        context: EvidenceCopyContext,
+    ) -> io::Result<AuditEntry> {
+        AuditLogger::log_evidence_copy(self, case_id, context)
+    }
+}
+
+pub struct FsEvidenceCopier;
+
+impl EvidenceCopier for FsEvidenceCopier {
+    fn copy_verified(&self, source: &Path, destination: &Path) -> io::Result<VerifiedCopy> {
+        crate::infrastructure::evidence_copy::create_verified_copy(source, destination)
     }
 }
 
@@ -45,6 +72,7 @@ impl Signer for SigningIdentity {
         final_sequence: u64,
         final_head_hash: &str,
         case_metadata_sha256: &str,
+        report_manifest_sha256: &str,
     ) -> io::Result<CaseSignature> {
         SigningIdentity::sign_case(
             self,
@@ -52,6 +80,7 @@ impl Signer for SigningIdentity {
             final_sequence,
             final_head_hash,
             case_metadata_sha256,
+            report_manifest_sha256,
         )
     }
 }
