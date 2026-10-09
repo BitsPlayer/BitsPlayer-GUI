@@ -29,9 +29,14 @@ fn main() {
         zip_path.with_extension("zip.sha256");
 
 
-    let expected =
-        fs::read_to_string(&hash_path)
-            .expect("Missing ZIP SHA256 file");
+    let expected = match fs::read_to_string(&hash_path) {
+        Ok(value) => value,
+        Err(_) => {
+            println!("INVALID EXPORT PACKAGE");
+            println!("Missing ZIP SHA256 file");
+            std::process::exit(1);
+        }
+    };
 
 
     let data =
