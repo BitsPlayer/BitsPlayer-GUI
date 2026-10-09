@@ -24,8 +24,12 @@ pub const MAP_B: Color = rgb(0x7B, 0xA0, 0x5B);
 pub const MAP_AUDIO: Color = rgb(0x8B, 0x6B, 0xB5);
 pub const MAP_FREE: Color = rgb(0x5C, 0x5F, 0x64);
 pub const MAP_UNKNOWN: Color = rgb(0x3E, 0x42, 0x46);
+pub const MAP_I_NON_IDR: Color = rgb(0x6F, 0xC3, 0xE0);
+pub const MAP_PARTIAL: Color = rgb(0xD9, 0x7A, 0x3A);
+pub const MAP_SKIPPED: Color = rgb(0x7A, 0x5C, 0x9E);
+pub const MAP_TRUNCATED: Color = rgb(0x9C, 0x3B, 0x3B);
 
-use bitplay::SpanKind;
+use crate::presentation::widgets::file_map::{AuClass, MapKind};
 use iced::border::Radius;
 use iced::widget::{button, container, text_input};
 use iced::{Background, Border, Shadow, Theme, Vector};
@@ -43,23 +47,51 @@ pub fn bitsplayer_theme() -> Theme {
     )
 }
 
-pub fn span_color(kind: SpanKind) -> Color {
+pub fn span_color(kind: MapKind) -> Color {
     let (base, gop) = match kind {
-        SpanKind::Ftyp => (MAP_FTYP, None),
-        SpanKind::Moov => (MAP_MOOV, None),
-        SpanKind::MdatHeader => (MAP_MDAT, None),
-        SpanKind::Free => (MAP_FREE, None),
-        SpanKind::Unknown => (MAP_UNKNOWN, None),
-        SpanKind::VideoI { gop } => (MAP_I, Some(gop)),
-        SpanKind::VideoP { gop } => (MAP_P, Some(gop)),
-        SpanKind::VideoB { gop } => (MAP_B, Some(gop)),
-        SpanKind::Audio => (MAP_AUDIO, None),
+        MapKind::Ftyp => (MAP_FTYP, None),
+        MapKind::Moov => (MAP_MOOV, None),
+        MapKind::MdatHeader => (MAP_MDAT, None),
+        MapKind::Free => (MAP_FREE, None),
+        MapKind::Unknown => (MAP_UNKNOWN, None),
+        MapKind::VideoI { gop } => (MAP_I, Some(gop)),
+        MapKind::VideoP { gop } => (MAP_P, Some(gop)),
+        MapKind::VideoB { gop } => (MAP_B, Some(gop)),
+        MapKind::Audio => (MAP_AUDIO, None),
+        MapKind::Au { complete: false, .. } => (MAP_PARTIAL, None),
+        MapKind::Au { class: AuClass::Idr, gop, .. } => (MAP_I, Some(gop)),
+        MapKind::Au { class: AuClass::Intra, gop, .. } => (MAP_I_NON_IDR, Some(gop)),
+        MapKind::Au { class: AuClass::Inter, gop, .. } => (MAP_P, Some(gop)),
+        MapKind::Skipped => (MAP_SKIPPED, None),
+        MapKind::Truncated => (MAP_TRUNCATED, None),
     };
     match gop {
         Some(g) if g % 2 == 1 => dim(base, 0.72),
         _ => base,
     }
 }
+
+pub const MOOV_LEGEND: [(Color, &str); 8] = [
+    (MAP_FTYP, "ftyp"),
+    (MAP_MOOV, "moov"),
+    (MAP_I, "I-frame"),
+    (MAP_P, "P-frame"),
+    (MAP_B, "B-frame"),
+    (MAP_AUDIO, "audio"),
+    (MAP_FREE, "free"),
+    (MAP_UNKNOWN, "unmapped"),
+];
+
+pub const CARVE_LEGEND: [(Color, &str); 8] = [
+    (MAP_MDAT, "mdat header"),
+    (MAP_I, "IDR"),
+    (MAP_I_NON_IDR, "I-frame (non-IDR)"),
+    (MAP_P, "P-frame"),
+    (MAP_PARTIAL, "partial access unit"),
+    (MAP_SKIPPED, "skipped region"),
+    (MAP_TRUNCATED, "truncated tail"),
+    (MAP_UNKNOWN, "unmapped"),
+];
 
 fn dim(c: Color, f: f32) -> Color {
     Color {

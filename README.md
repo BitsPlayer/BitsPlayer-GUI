@@ -97,7 +97,8 @@ Actions you will see:
 | `EVIDENCE_REGISTERED` | The working copy is registered for analysis. |
 | `ANALYSIS_STARTED` / `ANALYSIS_COMPLETED` / `ANALYSIS_FAILED` | Around the layout pass. |
 | `INTEGRITY_VERIFICATION` | The before/after evidence hashes have been compared. |
-| `EXTRACT_STARTED` / `EXTRACT_COMPLETED` / `EXTRACT_FAILED` | Around frame recovery. These rows include width, height, matrix, and the include flags. |
+| `CARVE_ANALYSIS_STARTED` / `CARVE_ANALYSIS_COMPLETED` / `CARVE_ANALYSIS_FAILED` | Around the H.264 carve of `mdat`, after integrity is verified. These rows include width, height, and the audio flag. |
+| `EXTRACT_STARTED` / `EXTRACT_COMPLETED` / `EXTRACT_FAILED` | Around frame recovery. These rows include width, height, matrix, and the include flags, plus `frame_offset` for single-frame extraction. Once a case has carve rows, each extract must follow a completed carve with the same width and height. |
 | `ARTIFACT_CREATED` | A PNG was written and hashed. The row links it to the source evidence hash. |
 | `CASE_CLOSED` | The seal succeeded. This is the last row. |
 

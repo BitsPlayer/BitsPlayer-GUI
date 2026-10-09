@@ -12,7 +12,7 @@ use crate::presentation::custody;
 use crate::presentation::extract::{self, SaveOutcome};
 use crate::forensic::audit::{AuditAction, AuditEntry, AuditLogger, AuditResult};
 use crate::forensic::case::Case;
-use crate::forensic::context::{HostContext, OperationContext};
+use crate::forensic::context::{CarveParameters, HostContext, OperationContext};
 use crate::forensic::evidence::IntegrityStatus;
 use crate::forensic::seal::SealReport;
 use crate::forensic::verify::VerificationReport;
@@ -48,6 +48,7 @@ pub enum Message {
 pub struct App {
     main_window: window::Id,
     hex_window: Option<window::Id>,
+    preview_window: Option<window::Id>,
     tab: Tab,
     analyze: analyze::State,
     extract: extract::State,
@@ -60,6 +61,7 @@ pub struct App {
     seal_review: Option<SealedCase>,
     notice: Option<String>,
     active_extraction: Option<OperationContext>,
+    active_carve: Option<OperationContext>,
 }
 
 impl App {
@@ -157,6 +159,7 @@ impl App {
             Self {
                 main_window,
                 hex_window: None,
+                preview_window: None,
                 tab: Tab::Analyze,
                 analyze: analyze::State::default(),
                 extract: extract::State::default(),
@@ -169,6 +172,7 @@ impl App {
                 seal_review: None,
                 notice: None,
                 active_extraction: None,
+                active_carve: None,
             },
             open.map(|_| Message::MainOpened),
         )
@@ -177,6 +181,8 @@ impl App {
     pub fn title(&self, window: window::Id) -> String {
         if Some(window) == self.hex_window {
             self.analyze.hex_title()
+        } else if Some(window) == self.preview_window {
+            self.extract.preview_title()
         } else {
             String::from("BitsPlayer")
         }
@@ -188,15 +194,20 @@ impl App {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let closed = window::close_requests().map(Message::CloseRequested);
+        let mut subscriptions = vec![closed];
         if self.extract.running {
-            Subscription::batch([
-                closed,
+            subscriptions.push(
                 iced::time::every(Duration::from_millis(80))
                     .map(|_| Message::Extract(extract::Message::Tick)),
-            ])
-        } else {
-            closed
+            );
         }
+        if self.analyze.carving {
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(80))
+                    .map(|_| Message::Analyze(analyze::Message::CarveTick)),
+            );
+        }
+        Subscription::batch(subscriptions)
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -218,6 +229,10 @@ impl App {
                 } else if Some(id) == self.hex_window {
                     self.hex_window = None;
                     let _ = self.analyze.update(analyze::Message::CloseHex);
+                    window::close(id)
+                } else if Some(id) == self.preview_window {
+                    self.preview_window = None;
+                    let _ = self.extract.update(extract::Message::ClosePreview);
                     window::close(id)
                 } else {
                     Task::none()
@@ -260,40 +275,28 @@ impl App {
                 Task::none()
             }
             Message::Analyze(analyze::Message::OpenExtract) => {
-                let evidence_verified = self
-                    .analyze
-                    .evidence
-                    .as_ref()
-                    .map(|evidence| evidence.integrity_status == IntegrityStatus::Verified)
-                    .unwrap_or(false);
-
-                if !evidence_verified {
+                if !self.extract.has_carve() {
                     self.analyze.error = Some(String::from(
-                        "Extraction is blocked until evidence integrity is verified and recorded in the audit log.",
+                        "Extraction is blocked until a carve analysis has completed and been recorded in the audit log.",
                     ));
-                    self.analyze.status = String::from("Extract blocked: evidence is not verified");
+                    self.analyze.status = String::from("Extract blocked: no carve analysis");
                     return Task::none();
                 }
 
-                if let Some(evidence) = self.analyze.evidence.as_ref() {
-                    self.extract
-                        .set_verified_evidence(evidence.path.clone(), evidence.sha256.clone());
+                self.tab = Tab::Extract;
+                Task::none()
+            }
+            Message::Analyze(analyze::Message::ExtractSelected(index)) => {
+                if !self.extract.has_carve() {
+                    self.analyze.error = Some(String::from(
+                        "Extraction is blocked until a carve analysis has completed and been recorded in the audit log.",
+                    ));
+                    self.analyze.status = String::from("Extract blocked: no carve analysis");
+                    return Task::none();
                 }
 
                 self.tab = Tab::Extract;
-
-                if let Some(v) = self
-                    .analyze
-                    .analysis
-                    .as_ref()
-                    .and_then(|a| a.video.as_ref())
-                    && v.width > 0
-                    && v.height > 0
-                {
-                    self.extract.prefill(v.width, v.height);
-                }
-
-                Task::none()
+                self.update_extract(extract::Message::RunSingle(index))
             }
             Message::Analyze(msg) => self.update_analyze(msg),
             Message::Extract(msg) => self.update_extract(msg),
@@ -341,6 +344,18 @@ impl App {
             let audit_path = self.case.case_directory.join("logs").join("audit.jsonl");
             if let Ok(entries) = crate::forensic::audit::read_verified_audit(&audit_path, self.case.id) {
                 self.audit_entries = entries;
+            }
+        }
+
+        if matches!(msg, analyze::Message::Browse) {
+            self.extract.clear_carve();
+        }
+
+        if matches!(msg, analyze::Message::Carve) {
+            if let Err(err) = self.start_carve_audit() {
+                self.analyze.error = Some(err);
+                self.analyze.status = String::from("Carve blocked");
+                return Task::none();
             }
         }
 
@@ -414,30 +429,21 @@ impl App {
             _ => None,
         };
 
+        let carve_outcome = match &msg {
+            analyze::Message::CarveFinished(result) => Some(result.clone()),
+            _ => None,
+        };
+
         let was_open = self.analyze.hex_is_open();
         let task = self.analyze.update(msg).map(Message::Analyze);
 
+        if let Some(result) = carve_outcome {
+            self.finish_carve_audit(result);
+        }
+
         if finished_successfully {
             match self.audit_analysis_success() {
-                Ok(()) => {
-                    if let Some(evidence) = self.analyze.evidence.as_ref()
-                        && evidence.integrity_status == IntegrityStatus::Verified
-                    {
-                        self.extract
-                            .set_verified_evidence(evidence.path.clone(), evidence.sha256.clone());
-                    }
-
-                    if let Some(v) = self
-                        .analyze
-                        .analysis
-                        .as_ref()
-                        .and_then(|a| a.video.as_ref())
-                        && v.width > 0
-                        && v.height > 0
-                    {
-                        self.extract.prefill(v.width, v.height);
-                    }
-                }
+                Ok(()) => {}
                 Err(err) => {
                     self.analyze.error = Some(err);
                     self.analyze.status = String::from("Analysis audit failure");
@@ -474,7 +480,12 @@ impl App {
     }
 
     fn update_extract(&mut self, msg: extract::Message) -> Task<Message> {
-        if matches!(msg, extract::Message::Run) {
+        if matches!(msg, extract::Message::Run | extract::Message::RunSingle(_)) {
+            self.extract.set_mode(match msg {
+                extract::Message::RunSingle(index) => Some(index),
+                _ => None,
+            });
+
             if let Err(err) = self.extract.validate_forensic_run() {
                 self.extract.error = Some(err.clone());
                 self.extract.status = err;
@@ -538,7 +549,15 @@ impl App {
         let is_tick = matches!(msg, extract::Message::Tick);
         let is_save = matches!(msg, extract::Message::Save);
 
+        let selected_before = self.extract.selected;
         let task = self.extract.update(msg).map(Message::Extract);
+        let task = match (selected_before, self.extract.selected) {
+            (Some(_), None) => Task::batch([task, self.close_preview_window()]),
+            (before, Some(now)) if before != Some(now) => {
+                Task::batch([task, self.ensure_preview_window()])
+            }
+            _ => task,
+        };
 
         if is_tick && was_running && !self.extract.running {
             let failed = self.extract.error.is_some();
@@ -601,6 +620,103 @@ impl App {
         }
 
         task
+    }
+
+    fn start_carve_audit(&mut self) -> Result<(), String> {
+        if self.extract.running {
+            return Err(String::from("Wait for the running extraction to finish"));
+        }
+        let parameters = self.analyze.carve_request()?;
+        let evidence = self
+            .analyze
+            .evidence
+            .as_ref()
+            .ok_or_else(|| String::from("No evidence loaded"))?;
+        let filename = evidence.filename.clone();
+        let sha256 = evidence.sha256.clone();
+        let context = carve_context(&evidence.path, parameters);
+        let case_id = self.case.id;
+
+        let entry = {
+            let mut audit = self.audit_mut();
+            let Some(logger) = audit.as_mut() else {
+                return Err(String::from(
+                    "Forensic audit logger is unavailable. Carve aborted.",
+                ));
+            };
+            logger
+                .log_with_context(
+                    case_id,
+                    AuditAction::CarveAnalysisStarted,
+                    Some(filename),
+                    Some(sha256),
+                    None,
+                    AuditResult::Started,
+                    context.clone(),
+                )
+                .map_err(|err| format!("Failed to record carve start in forensic audit: {err}"))?
+        };
+        self.audit_entries.push(entry);
+        self.active_carve = Some(context);
+        Ok(())
+    }
+
+    fn finish_carve_audit(&mut self, result: Result<Arc<analyze::CarveResult>, String>) {
+        let evidence = self.analyze.evidence.as_ref();
+        let filename = evidence.map(|e| e.filename.clone());
+        let sha256 = evidence.map(|e| e.sha256.clone());
+        let failed = result.is_err();
+        let case_id = self.case.id;
+
+        let recorded = match self.active_carve.take() {
+            None => Err(String::from(
+                "Carve finished, but the forensic parameter snapshot is missing.",
+            )),
+            Some(context) => {
+                let mut audit = self.audit_mut();
+                match audit.as_mut() {
+                    None => Err(String::from(
+                        "Carve finished, but the forensic audit logger is unavailable.",
+                    )),
+                    Some(logger) => logger
+                        .log_with_context(
+                            case_id,
+                            if failed {
+                                AuditAction::CarveAnalysisFailed
+                            } else {
+                                AuditAction::CarveAnalysisCompleted
+                            },
+                            filename,
+                            sha256,
+                            None,
+                            if failed {
+                                AuditResult::Failed
+                            } else {
+                                AuditResult::Success
+                            },
+                            context,
+                        )
+                        .map_err(|err| err.to_string()),
+                }
+            }
+        };
+
+        match recorded {
+            Ok(entry) => {
+                self.audit_entries.push(entry);
+                if let Ok(carve) = result {
+                    self.extract.set_carve(carve);
+                }
+            }
+            Err(err) => {
+                let existing = self.analyze.error.clone();
+                self.analyze.error = Some(match existing {
+                    Some(previous) => format!("{previous}\nForensic audit write failed: {err}"),
+                    None => format!("Carve finished, but the forensic audit write failed: {err}"),
+                });
+                self.analyze.status = String::from("Carve audit failure");
+            }
+        }
     }
 
     fn extract_evidence_identity(&self) -> (Option<String>, Option<String>) {
@@ -817,11 +933,36 @@ impl App {
             size: Size::new(920.0, 640.0),
             position: window::Position::Centered,
             min_size: Some(Size::new(520.0, 360.0)),
+            exit_on_close_request: false,
             ..Default::default()
         });
 
         self.hex_window = Some(id);
         open.map(|_| Message::HexOpened)
+    }
+
+    fn ensure_preview_window(&mut self) -> Task<Message> {
+        if let Some(id) = self.preview_window {
+            return window::gain_focus(id);
+        }
+
+        let (id, open) = window::open(window::Settings {
+            size: Size::new(1000.0, 700.0),
+            position: window::Position::Centered,
+            min_size: Some(Size::new(400.0, 300.0)),
+            exit_on_close_request: false,
+            ..Default::default()
+        });
+
+        self.preview_window = Some(id);
+        open.map(|_| Message::HexOpened)
+    }
+
+    fn close_preview_window(&mut self) -> Task<Message> {
+        match self.preview_window.take() {
+            Some(id) => window::close(id),
+            None => Task::none(),
+        }
     }
 
     fn close_hex_window(&mut self) -> Task<Message> {
@@ -834,6 +975,9 @@ impl App {
     pub fn view(&self, window: window::Id) -> Element<'_, Message> {
         if Some(window) == self.hex_window {
             return self.analyze.hex_window_view().map(Message::Analyze);
+        }
+        if Some(window) == self.preview_window {
+            return self.extract.preview_window_view().map(Message::Extract);
         }
 
         let reviewing = self.seal_review.is_some();
@@ -938,6 +1082,13 @@ impl App {
         }
 
         column.push(body).height(Fill).into()
+    }
+}
+
+fn carve_context(path: &Path, parameters: CarveParameters) -> OperationContext {
+    OperationContext {
+        carve_parameters: Some(parameters),
+        ..OperationContext::evidence(path)
     }
 }
 

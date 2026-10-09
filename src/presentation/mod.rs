@@ -6,6 +6,7 @@ pub mod custody;
 pub mod export_cli;
 pub mod export_verify_cli;
 pub mod extract;
+pub mod progress;
 pub mod report_cli;
 pub mod theme;
 pub mod verify_cli;

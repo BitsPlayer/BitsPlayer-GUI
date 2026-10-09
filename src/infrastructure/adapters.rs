@@ -134,7 +134,7 @@ impl FrameExtractor for IframeExtractor {
         data: &[u8],
         input_name: &str,
         options: &iframe_extract::extract::Options,
-        reporter: &mut dyn iframe_extract::report::Reporter,
+        reporter: &mut (dyn iframe_extract::report::Reporter + Send),
     ) -> Result<iframe_extract::extract::Extraction> {
         iframe_extract::extract::extract_with(data, input_name, options, reporter)
             .map_err(|err| anyhow::anyhow!(err))

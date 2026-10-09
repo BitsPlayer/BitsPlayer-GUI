@@ -79,7 +79,7 @@ pub trait FrameExtractor {
         data: &[u8],
         input_name: &str,
         options: &iframe_extract::extract::Options,
-        reporter: &mut dyn iframe_extract::report::Reporter,
+        reporter: &mut (dyn iframe_extract::report::Reporter + Send),
     ) -> Result<iframe_extract::extract::Extraction>;
 }
 
@@ -92,7 +92,7 @@ pub fn extract_frames(
     input_name: &str,
     options: &iframe_extract::extract::Options,
     extractor: &impl FrameExtractor,
-    reporter: &mut dyn iframe_extract::report::Reporter,
+    reporter: &mut (dyn iframe_extract::report::Reporter + Send),
 ) -> Result<iframe_extract::extract::Extraction> {
     extractor.extract(data, input_name, options, reporter)
 }

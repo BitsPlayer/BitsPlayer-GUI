@@ -102,6 +102,7 @@ pub fn verify_case_directories(
     summary.ok("first audit entry is CASE_CREATED");
 
     verify_operation_context(&case, &entries, &mut summary)?;
+    verify_carve_ordering(&entries, &mut summary)?;
     verify_copy_lifecycle(&entries, &mut summary)?;
     verify_evidence_copies(&entries, case_directory, &mut summary)?;
 
@@ -264,6 +265,44 @@ fn verify_operation_context(
 
     for entry in entries {
         match entry.action {
+            AuditAction::CarveAnalysisStarted | AuditAction::CarveAnalysisCompleted => {
+                let context = entry.operation_context.as_ref().ok_or_else(|| {
+                    format!(
+                        "{:?} sequence {} is missing operation_context",
+                        entry.action, entry.sequence
+                    )
+                })?;
+                if context
+                    .evidence_path
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+                {
+                    return Err(format!(
+                        "{:?} sequence {} is missing evidence_path",
+                        entry.action, entry.sequence
+                    ));
+                }
+                if context.extraction_parameters.is_some() {
+                    return Err(format!(
+                        "{:?} sequence {} unexpectedly contains extraction parameters",
+                        entry.action, entry.sequence
+                    ));
+                }
+                let parameters = context.carve_parameters.as_ref().ok_or_else(|| {
+                    format!(
+                        "{:?} sequence {} is missing carve_parameters",
+                        entry.action, entry.sequence
+                    )
+                })?;
+                if parameters.width == 0 || parameters.height == 0 {
+                    return Err(format!(
+                        "{:?} sequence {} contains invalid carve dimensions {}x{}",
+                        entry.action, entry.sequence, parameters.width, parameters.height
+                    ));
+                }
+            }
             AuditAction::EvidenceRegistered
             | AuditAction::AnalysisStarted
             | AuditAction::AnalysisCompleted
@@ -289,6 +328,12 @@ fn verify_operation_context(
                 if context.extraction_parameters.is_some() {
                     return Err(format!(
                         "{:?} sequence {} unexpectedly contains extraction parameters",
+                        entry.action, entry.sequence
+                    ));
+                }
+                if context.carve_parameters.is_some() {
+                    return Err(format!(
+                        "{:?} sequence {} unexpectedly contains carve parameters",
                         entry.action, entry.sequence
                     ));
                 }
@@ -341,7 +386,9 @@ fn verify_operation_context(
                     }
                 }
             }
-            AuditAction::AnalysisFailed | AuditAction::ExtractFailed => {}
+            AuditAction::AnalysisFailed
+            | AuditAction::CarveAnalysisFailed
+            | AuditAction::ExtractFailed => {}
             AuditAction::CaseCreated
             | AuditAction::CaseMetadataUpdated
             | AuditAction::CaseClosed
@@ -352,6 +399,81 @@ fn verify_operation_context(
     }
 
     summary.ok("operation context is structurally valid for analysis/extraction entries");
+    Ok(())
+}
+
+fn verify_carve_ordering(
+    entries: &[AuditEntry],
+    summary: &mut VerificationReport,
+) -> Result<(), String> {
+    let has_carve = entries.iter().any(|entry| {
+        matches!(
+            entry.action,
+            AuditAction::CarveAnalysisStarted
+                | AuditAction::CarveAnalysisCompleted
+                | AuditAction::CarveAnalysisFailed
+        )
+    });
+    if !has_carve {
+        summary.ok("no carve analysis rows; extraction ordering rules unchanged");
+        return Ok(());
+    }
+
+    let mut verified_paths: Vec<&str> = Vec::new();
+    let mut completed_carves: Vec<(&str, u32, u32)> = Vec::new();
+    for entry in entries {
+        let context = entry.operation_context.as_ref();
+        let path = context
+            .and_then(|context| context.evidence_path.as_deref())
+            .unwrap_or("");
+        match entry.action {
+            AuditAction::IntegrityVerification if entry.result == AuditResult::Verified => {
+                verified_paths.push(path);
+            }
+            AuditAction::CarveAnalysisStarted => {
+                if !verified_paths.contains(&path) {
+                    return Err(format!(
+                        "CARVE_ANALYSIS_STARTED sequence {} is not preceded by a verified INTEGRITY_VERIFICATION for {path}",
+                        entry.sequence
+                    ));
+                }
+            }
+            AuditAction::CarveAnalysisCompleted => {
+                if let Some(parameters) = context.and_then(|c| c.carve_parameters.as_ref()) {
+                    completed_carves.push((path, parameters.width, parameters.height));
+                }
+            }
+            AuditAction::ExtractStarted => {
+                let parameters = context
+                    .and_then(|context| context.extraction_parameters.as_ref())
+                    .ok_or_else(|| {
+                        format!(
+                            "EXTRACT_STARTED sequence {} is missing extraction_parameters",
+                            entry.sequence
+                        )
+                    })?;
+                let carve = completed_carves
+                    .iter()
+                    .rev()
+                    .find(|(carve_path, _, _)| *carve_path == path)
+                    .ok_or_else(|| {
+                        format!(
+                            "EXTRACT_STARTED sequence {} is not preceded by a CARVE_ANALYSIS_COMPLETED for {path}",
+                            entry.sequence
+                        )
+                    })?;
+                if carve.1 != parameters.width || carve.2 != parameters.height {
+                    return Err(format!(
+                        "EXTRACT_STARTED sequence {} uses {}x{} but the completed carve analysis used {}x{}",
+                        entry.sequence, parameters.width, parameters.height, carve.1, carve.2
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    summary.ok("carve analysis follows verified integrity and precedes every extraction");
     Ok(())
 }
 
@@ -934,7 +1056,9 @@ mod tests {
     use crate::domain::artifact::ArtifactRecord;
     use crate::domain::audit::EvidenceCopyContext;
     use crate::domain::audit::{AuditAction, AuditResult};
-    use crate::domain::context::HostContext;
+    use crate::domain::context::{
+        CarveParameters, ExtractionParameters, HostContext, OperationContext,
+    };
     use crate::infrastructure::audit::AuditLogger;
     use crate::infrastructure::evidence_copy::create_verified_copy;
     use crate::infrastructure::signing::SigningIdentity;
@@ -1505,5 +1629,197 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(case_dir);
+    }
+
+    fn carve_context(path: &str, width: u32, height: u32) -> OperationContext {
+        let mut context = OperationContext::evidence(Path::new(path));
+        context.carve_parameters = Some(CarveParameters {
+            width,
+            height,
+            with_audio: false,
+        });
+        context
+    }
+
+    fn extract_context(path: &str, width: u32, height: u32) -> OperationContext {
+        OperationContext::extraction(
+            Path::new(path),
+            ExtractionParameters {
+                width,
+                height,
+                matrix: String::from("BT.709"),
+                include_non_idr: false,
+                include_partial: false,
+                with_audio: false,
+                all_frames: false,
+                frame_offset: None,
+            },
+        )
+    }
+
+    fn log_step(
+        logger: &mut AuditLogger,
+        case_id: uuid::Uuid,
+        action: AuditAction,
+        result: AuditResult,
+        context: OperationContext,
+    ) {
+        logger
+            .log_with_context(case_id, action, None, None, None, result, context)
+            .unwrap();
+    }
+
+    fn check_context_and_carve(entries: &[AuditEntry]) -> Result<(), String> {
+        let case = Case::new(
+            "t",
+            entries[0].host_context.examiner.clone(),
+            PathBuf::from("/tmp/unused"),
+        );
+        let mut summary = VerificationReport::default();
+        verify_operation_context(&case, entries, &mut summary)?;
+        verify_carve_ordering(entries, &mut summary)
+    }
+
+    const EV: &str = "evidence/working-1.mp4";
+
+    fn integrity(logger: &mut AuditLogger, case_id: uuid::Uuid) {
+        log_step(
+            logger,
+            case_id,
+            AuditAction::IntegrityVerification,
+            AuditResult::Verified,
+            OperationContext::evidence(Path::new(EV)),
+        );
+    }
+
+    fn carve_pair(logger: &mut AuditLogger, case_id: uuid::Uuid, width: u32, height: u32) {
+        log_step(
+            logger,
+            case_id,
+            AuditAction::CarveAnalysisStarted,
+            AuditResult::Started,
+            carve_context(EV, width, height),
+        );
+        log_step(
+            logger,
+            case_id,
+            AuditAction::CarveAnalysisCompleted,
+            AuditResult::Success,
+            carve_context(EV, width, height),
+        );
+    }
+
+    fn extract_started(logger: &mut AuditLogger, case_id: uuid::Uuid, width: u32, height: u32) {
+        log_step(
+            logger,
+            case_id,
+            AuditAction::ExtractStarted,
+            AuditResult::Started,
+            extract_context(EV, width, height),
+        );
+    }
+
+    #[test]
+    fn carve_then_matching_extract_is_accepted() {
+        let entries = audit_entries("carve_ok", |logger, case_id| {
+            integrity(logger, case_id);
+            carve_pair(logger, case_id, 64, 48);
+            extract_started(logger, case_id, 64, 48);
+        });
+        check_context_and_carve(&entries).unwrap();
+    }
+
+    #[test]
+    fn extract_dimensions_must_match_the_completed_carve() {
+        let entries = audit_entries("carve_mismatch", |logger, case_id| {
+            integrity(logger, case_id);
+            carve_pair(logger, case_id, 64, 48);
+            extract_started(logger, case_id, 64, 32);
+        });
+        let error = check_context_and_carve(&entries).unwrap_err();
+        assert!(error.contains("64x32"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn extract_without_a_completed_carve_is_rejected_once_carving_is_used() {
+        let entries = audit_entries("carve_missing_before_extract", |logger, case_id| {
+            integrity(logger, case_id);
+            extract_started(logger, case_id, 64, 48);
+            carve_pair(logger, case_id, 64, 48);
+        });
+        assert!(check_context_and_carve(&entries).is_err());
+    }
+
+    #[test]
+    fn carve_before_verified_integrity_is_rejected() {
+        let entries = audit_entries("carve_before_integrity", |logger, case_id| {
+            carve_pair(logger, case_id, 64, 48);
+            integrity(logger, case_id);
+        });
+        let error = check_context_and_carve(&entries).unwrap_err();
+        assert!(
+            error.contains("INTEGRITY_VERIFICATION"),
+            "unexpected error: {error}"
+        );
+
+        let entries = audit_entries("carve_unverified_integrity", |logger, case_id| {
+            log_step(
+                logger,
+                case_id,
+                AuditAction::IntegrityVerification,
+                AuditResult::Unverified,
+                OperationContext::evidence(Path::new(EV)),
+            );
+            carve_pair(logger, case_id, 64, 48);
+        });
+        assert!(check_context_and_carve(&entries).is_err());
+    }
+
+    #[test]
+    fn carve_rows_require_parameters() {
+        let entries = audit_entries("carve_no_params", |logger, case_id| {
+            integrity(logger, case_id);
+            log_step(
+                logger,
+                case_id,
+                AuditAction::CarveAnalysisStarted,
+                AuditResult::Started,
+                OperationContext::evidence(Path::new(EV)),
+            );
+        });
+        let error = check_context_and_carve(&entries).unwrap_err();
+        assert!(
+            error.contains("carve_parameters"),
+            "unexpected error: {error}"
+        );
+
+        let entries = audit_entries("carve_zero_dims", |logger, case_id| {
+            integrity(logger, case_id);
+            carve_pair(logger, case_id, 0, 48);
+        });
+        assert!(check_context_and_carve(&entries).is_err());
+    }
+
+    #[test]
+    fn analysis_rows_must_not_carry_carve_parameters() {
+        let entries = audit_entries("analysis_with_carve", |logger, case_id| {
+            log_step(
+                logger,
+                case_id,
+                AuditAction::AnalysisStarted,
+                AuditResult::Started,
+                carve_context(EV, 64, 48),
+            );
+        });
+        assert!(check_context_and_carve(&entries).is_err());
+    }
+
+    #[test]
+    fn legacy_case_without_carve_rows_still_passes() {
+        let entries = audit_entries("carve_legacy", |logger, case_id| {
+            integrity(logger, case_id);
+            extract_started(logger, case_id, 64, 48);
+        });
+        check_context_and_carve(&entries).unwrap();
     }
 }

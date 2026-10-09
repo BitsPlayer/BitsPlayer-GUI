@@ -2,31 +2,40 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use bitplay::{Analysis, LayoutSpan, SpanKind};
+use bitplay::Analysis;
+use iframe_extract::extract::{CarveAnalysis, CarveOptions};
+use sha2::{Digest, Sha256};
 
 use iced::widget::canvas::Canvas;
 use iced::widget::{
     button,
+    checkbox,
     column,
     container,
+    progress_bar,
     row,
     scrollable,
     text,
+    text_input,
     Space,
 };
 use iced::{Element, Fill, Font, Task};
 
 use crate::domain::evidence::VerifiedCopy;
+use crate::forensic::context::CarveParameters;
 use crate::forensic::evidence::{
     EvidenceRecord,
     IntegrityStatus,
 };
 
+use crate::presentation::progress::ChannelReporter;
 use crate::presentation::theme;
 
 use crate::presentation::widgets::file_map::{
     FileMap,
+    MapKind,
     MapMessage,
+    MapSpan,
 };
 
 use crate::presentation::widgets::hex_view;
@@ -91,23 +100,71 @@ pub enum Message {
     CloseHex,
 
     OpenExtract,
+
+    CarveWidth(
+        String,
+    ),
+
+    CarveHeight(
+        String,
+    ),
+
+    CarveAudio(
+        bool,
+    ),
+
+    Carve,
+
+    CarveTick,
+
+    CarveFinished(
+        Result<
+            Arc<CarveResult>,
+            String,
+        >,
+    ),
+
+    SetLayout(
+        Layout,
+    ),
+
+    ExtractSelected(
+        usize,
+    ),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    Moov,
+    Carved,
+}
+
+#[derive(Debug)]
+pub struct CarveResult {
+    pub data: Arc<Vec<u8>>,
+
+    pub analysis: CarveAnalysis,
+
+    pub path: PathBuf,
+
+    pub sha256: String,
 }
 
 enum HexPane {
     Closed,
 
     Loading {
-        span: LayoutSpan,
+        span: MapSpan,
     },
 
     Ready {
-        span: LayoutSpan,
+        span: MapSpan,
         shown: u64,
         bytes: Arc<Vec<u8>>,
     },
 
     Failed {
-        span: LayoutSpan,
+        span: MapSpan,
         error: String,
     },
 }
@@ -128,7 +185,23 @@ pub struct State {
     pub evidence:
         Option<EvidenceRecord>,
 
-    pub map: Option<FileMap>,
+    pub moov_map: Option<FileMap>,
+
+    pub carve_map: Option<FileMap>,
+
+    pub layout: Layout,
+
+    pub width: String,
+
+    pub height: String,
+
+    pub with_audio: bool,
+
+    pub carving: bool,
+
+    pub carve: Option<Arc<CarveResult>>,
+
+    carve_progress: ChannelReporter,
 
     pub status: String,
 
@@ -150,7 +223,23 @@ impl Default for State {
 
             evidence: None,
 
-            map: None,
+            moov_map: None,
+
+            carve_map: None,
+
+            layout: Layout::Moov,
+
+            width: String::new(),
+
+            height: String::new(),
+
+            with_audio: false,
+
+            carving: false,
+
+            carve: None,
+
+            carve_progress: ChannelReporter::default(),
 
             status:
                 String::from(
@@ -216,8 +305,24 @@ impl State {
                 self.evidence =
                     None;
 
-                self.map =
+                self.moov_map =
                     None;
+
+                self.carve_map =
+                    None;
+
+                self.carve =
+                    None;
+
+                self.carving =
+                    false;
+
+                self.layout =
+                    Layout::Moov;
+
+                self.width.clear();
+
+                self.height.clear();
 
                 self.close_hex();
 
@@ -544,12 +649,29 @@ impl State {
                         analysis,
                         evidence,
                     )) => {
-                        self.map =
+                        self.moov_map =
                             Some(
                                 FileMap::from_analysis(
                                     &analysis,
                                 ),
                             );
+
+                        self.layout =
+                            Layout::Moov;
+
+                        if let Some(v) =
+                            &analysis.video
+                        {
+                            if v.width > 0 {
+                                self.width =
+                                    v.width.to_string();
+                            }
+
+                            if v.height > 0 {
+                                self.height =
+                                    v.height.to_string();
+                            }
+                        }
 
                         self.status =
                             if analysis
@@ -566,7 +688,7 @@ impl State {
                                 )
                             } else {
                                 String::from(
-                                    "No moov index — layout is incomplete. Evidence integrity verified. Use Extract on truncated files.",
+                                    "No moov index — layout is incomplete. Evidence integrity verified. Carve the stream to map access units.",
                                 )
                             };
 
@@ -709,6 +831,325 @@ impl State {
             Message::OpenExtract => {
                 Task::none()
             }
+
+            Message::ExtractSelected(
+                _,
+            ) => {
+                Task::none()
+            }
+
+            Message::CarveWidth(
+                v,
+            ) => {
+                if !self.carving {
+                    self.width =
+                        v;
+                }
+
+                Task::none()
+            }
+
+            Message::CarveHeight(
+                v,
+            ) => {
+                if !self.carving {
+                    self.height =
+                        v;
+                }
+
+                Task::none()
+            }
+
+            Message::CarveAudio(
+                v,
+            ) => {
+                if !self.carving {
+                    self.with_audio =
+                        v;
+                }
+
+                Task::none()
+            }
+
+            Message::Carve => {
+                self.start_carve()
+            }
+
+            Message::CarveTick => {
+                if self.carving
+                    && let Ok(g) =
+                        self.carve_progress.inner.lock()
+                {
+                    self.status =
+                        format!(
+                            "{}  {}%  {}",
+                            g.phase,
+                            g.percent(),
+                            g.detail,
+                        );
+                }
+
+                Task::none()
+            }
+
+            Message::CarveFinished(
+                result,
+            ) => {
+                self.carving =
+                    false;
+
+                match result {
+                    Ok(carve) => {
+                        self.carve_map =
+                            Some(
+                                FileMap::from_carve(
+                                    &carve.analysis,
+                                    carve.data.len() as u64,
+                                ),
+                            );
+
+                        self.status =
+                            carve_summary(
+                                &carve.analysis,
+                                carve.data.len() as u64,
+                            );
+
+                        self.carve =
+                            Some(
+                                carve,
+                            );
+
+                        self.layout =
+                            Layout::Carved;
+
+                        self.error =
+                            None;
+
+                        self.close_hex();
+                    }
+
+                    Err(err) => {
+                        self.error =
+                            Some(
+                                err,
+                            );
+
+                        self.status =
+                            String::from(
+                                "Carve failed",
+                            );
+                    }
+                }
+
+                Task::none()
+            }
+
+            Message::SetLayout(
+                layout,
+            ) => {
+                let available =
+                    match layout {
+                        Layout::Moov => {
+                            self.moov_map.is_some()
+                                && self
+                                    .analysis
+                                    .as_ref()
+                                    .is_some_and(
+                                        |a| a.moov_present,
+                                    )
+                        }
+
+                        Layout::Carved => {
+                            self.carve_map.is_some()
+                        }
+                    };
+
+                if available
+                    && self.layout != layout
+                {
+                    self.layout =
+                        layout;
+
+                    self.close_hex();
+                }
+
+                Task::none()
+            }
+        }
+    }
+
+    pub fn carve_request(
+        &self,
+    ) -> Result<
+        CarveParameters,
+        String,
+    > {
+        if self.busy
+            || self.carving
+        {
+            return Err(
+                String::from(
+                    "Analysis or carve already running",
+                ),
+            );
+        }
+
+        let verified =
+            self.evidence
+                .as_ref()
+                .is_some_and(
+                    |e| {
+                        e.integrity_status
+                            == IntegrityStatus::Verified
+                    },
+                );
+
+        if !verified {
+            return Err(
+                String::from(
+                    "Carve is blocked until evidence integrity is verified",
+                ),
+            );
+        }
+
+        let width =
+            match self.width.trim().parse::<u32>() {
+                Ok(w) if w > 0 => w,
+
+                _ => {
+                    return Err(
+                        String::from(
+                            "Enter a valid width — required when SPS is lost",
+                        ),
+                    );
+                }
+            };
+
+        let height =
+            match self.height.trim().parse::<u32>() {
+                Ok(h) if h > 0 => h,
+
+                _ => {
+                    return Err(
+                        String::from(
+                            "Enter a valid height — required when SPS is lost",
+                        ),
+                    );
+                }
+            };
+
+        Ok(
+            CarveParameters {
+                width,
+                height,
+                with_audio:
+                    self.with_audio,
+            },
+        )
+    }
+
+    fn start_carve(
+        &mut self,
+    ) -> Task<Message> {
+        let parameters =
+            match self.carve_request() {
+                Ok(p) => p,
+
+                Err(err) => {
+                    self.error =
+                        Some(
+                            err,
+                        );
+
+                    return Task::none();
+                }
+            };
+
+        let Some(evidence) =
+            self.evidence
+                .clone()
+        else {
+            return Task::none();
+        };
+
+        self.carving =
+            true;
+
+        self.error =
+            None;
+
+        self.status =
+            String::from(
+                "Starting carve…",
+            );
+
+        if let Ok(mut g) =
+            self.carve_progress.inner.lock()
+        {
+            g.reset(
+                "starting",
+            );
+        }
+
+        let mut reporter =
+            self.carve_progress.clone();
+
+        Task::perform(
+            async move {
+                match tokio::task::spawn_blocking(
+                    move || {
+                        run_carve(
+                            &evidence,
+                            &parameters,
+                            &mut reporter,
+                        )
+                    },
+                )
+                .await
+                {
+                    Ok(result) => {
+                        result
+                    }
+
+                    Err(e) => {
+                        Err(
+                            format!(
+                                "Carve task failed: {e}"
+                            ),
+                        )
+                    }
+                }
+            },
+
+            Message::CarveFinished,
+        )
+    }
+
+    fn active_map(
+        &self,
+    ) -> Option<&FileMap> {
+        match self.layout {
+            Layout::Moov => {
+                self.moov_map.as_ref()
+            }
+
+            Layout::Carved => {
+                self.carve_map.as_ref()
+            }
+        }
+    }
+
+    fn active_map_mut(
+        &mut self,
+    ) -> Option<&mut FileMap> {
+        match self.layout {
+            Layout::Moov => {
+                self.moov_map.as_mut()
+            }
+
+            Layout::Carved => {
+                self.carve_map.as_mut()
+            }
         }
     }
 
@@ -720,7 +1161,7 @@ impl State {
                 self.rail(),
             )
             .width(
-                268,
+                320,
             )
             .padding(
                 16,
@@ -734,7 +1175,7 @@ impl State {
 
         let map =
             if let Some(map) =
-                &self.map
+                self.active_map()
             {
                 container(
                     Element::<MapMessage>::from(
@@ -852,25 +1293,17 @@ impl State {
         &mut self,
         index: usize,
     ) -> Task<Message> {
-        let Some(analysis) =
-            &self.analysis
-        else {
-            return Task::none();
-        };
-
         let Some(span) =
-            analysis
-                .spans
-                .get(
-                    index,
+            self.active_map()
+                .and_then(
+                    |map| map.spans.get(index).cloned(),
                 )
-                .cloned()
         else {
             return Task::none();
         };
 
         if let Some(map) =
-            &self.map
+            self.active_map()
             && map.selected
                 == Some(index)
             && matches!(
@@ -887,7 +1320,7 @@ impl State {
         }
 
         if let Some(map) =
-            &mut self.map
+            self.active_map_mut()
         {
             map.selected =
                 Some(
@@ -974,8 +1407,12 @@ impl State {
         self.hex =
             HexPane::Closed;
 
-        if let Some(map) =
-            &mut self.map
+        for map in [
+            self.moov_map.as_mut(),
+            self.carve_map.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
         {
             map.selected =
                 None;
@@ -984,7 +1421,7 @@ impl State {
 
     fn hex_span(
         &self,
-    ) -> Option<&LayoutSpan> {
+    ) -> Option<&MapSpan> {
         match &self.hex {
             HexPane::Closed => {
                 None
@@ -1203,6 +1640,383 @@ impl State {
         )
     }
 
+    fn verified(
+        &self,
+    ) -> bool {
+        self.evidence
+            .as_ref()
+            .is_some_and(
+                |e| {
+                    e.integrity_status
+                        == IntegrityStatus::Verified
+                },
+            )
+    }
+
+    fn details(
+        &self,
+    ) -> Option<Element<'_, Message>> {
+        let span =
+            self.hex_span()?;
+
+        let mut lines:
+            Vec<Element<'_, Message>> =
+            vec![
+                text(
+                    "SELECTED BLOCK",
+                )
+                .size(
+                    11,
+                )
+                .color(
+                    theme::MUTED,
+                )
+                .into(),
+
+                kv(
+                    "Kind",
+                    span.kind.label().to_string(),
+                ),
+
+                kv(
+                    "Offset",
+                    format!(
+                        "{} (0x{:08X})",
+                        span.offset,
+                        span.offset,
+                    ),
+                ),
+
+                kv(
+                    "Size",
+                    format!(
+                        "{} ({})",
+                        span.size,
+                        bitplay::human_bytes(
+                            span.size,
+                        ),
+                    ),
+                ),
+            ];
+
+        if let Some(n) =
+            span.slices
+        {
+            lines.push(
+                kv(
+                    "Slices",
+                    n.to_string(),
+                ),
+            );
+        }
+
+        if let Some(gop) =
+            span.kind.gop()
+        {
+            lines.push(
+                kv(
+                    "GOP",
+                    gop.to_string(),
+                ),
+            );
+        }
+
+        if let MapKind::Au {
+            complete,
+            ..
+        } = span.kind
+        {
+            lines.push(
+                kv(
+                    "State",
+                    String::from(
+                        if complete {
+                            "complete"
+                        } else {
+                            "partial"
+                        },
+                    ),
+                ),
+            );
+        }
+
+        if let Some(au) =
+            span.au
+        {
+            lines.push(
+                button(
+                    text(
+                        "Extract this frame",
+                    )
+                    .size(
+                        14,
+                    ),
+                )
+                .on_press(
+                    Message::ExtractSelected(
+                        au,
+                    ),
+                )
+                .style(
+                    theme::primary_button,
+                )
+                .width(
+                    Fill,
+                )
+                .padding([
+                    10,
+                    14,
+                ])
+                .into(),
+            );
+        }
+
+        Some(
+            column(
+                lines,
+            )
+            .spacing(
+                6,
+            )
+            .into(),
+        )
+    }
+
+    fn carve_section(
+        &self,
+        analysis: &Analysis,
+    ) -> Element<'_, Message> {
+        let idle =
+            !self.carving
+                && !self.busy;
+
+        let mut col =
+            column![
+                text(
+                    "CARVE",
+                )
+                .size(
+                    11,
+                )
+                .color(
+                    theme::MUTED,
+                ),
+
+                row![
+                    text_input(
+                        "width",
+                        &self.width,
+                    )
+                    .on_input_maybe(
+                        idle.then_some(
+                            Message::CarveWidth,
+                        ),
+                    )
+                    .style(
+                        theme::field,
+                    )
+                    .width(
+                        88,
+                    )
+                    .padding(
+                        8,
+                    ),
+
+                    text(
+                        "×",
+                    )
+                    .size(
+                        16,
+                    )
+                    .color(
+                        theme::MUTED,
+                    ),
+
+                    text_input(
+                        "height",
+                        &self.height,
+                    )
+                    .on_input_maybe(
+                        idle.then_some(
+                            Message::CarveHeight,
+                        ),
+                    )
+                    .style(
+                        theme::field,
+                    )
+                    .width(
+                        88,
+                    )
+                    .padding(
+                        8,
+                    ),
+                ]
+                .spacing(
+                    8,
+                )
+                .align_y(
+                    iced::Alignment::Center,
+                ),
+
+                checkbox(
+                    "With audio",
+                    self.with_audio,
+                )
+                .on_toggle_maybe(
+                    idle.then_some(
+                        Message::CarveAudio,
+                    ),
+                )
+                .size(
+                    16,
+                )
+                .text_size(
+                    13,
+                ),
+
+                button(
+                    text(
+                        if self.carving {
+                            "Carving…"
+                        } else if self.carve.is_some() {
+                            "Re-run carve"
+                        } else {
+                            "Carve"
+                        },
+                    )
+                    .size(
+                        14,
+                    ),
+                )
+                .on_press_maybe(
+                    (idle
+                        && self.carve_request().is_ok())
+                    .then_some(
+                        Message::Carve,
+                    ),
+                )
+                .style(
+                    theme::primary_button,
+                )
+                .width(
+                    Fill,
+                )
+                .padding([
+                    10,
+                    14,
+                ]),
+            ]
+            .spacing(
+                6,
+            );
+
+        if self.carving {
+            let pct =
+                self.carve_progress
+                    .inner
+                    .lock()
+                    .map(|g| g.percent())
+                    .unwrap_or(0);
+
+            col =
+                col.push(
+                    progress_bar(
+                        0.0..=100.0,
+                        pct as f32,
+                    )
+                    .height(
+                        6,
+                    ),
+                );
+        }
+
+        if self.carve.is_some() {
+            let moov_enabled =
+                analysis.moov_present;
+
+            col =
+                col.push(
+                    row![
+                        button(
+                            text(
+                                "Moov layout",
+                            )
+                            .size(
+                                13,
+                            ),
+                        )
+                        .on_press_maybe(
+                            moov_enabled.then_some(
+                                Message::SetLayout(
+                                    Layout::Moov,
+                                ),
+                            ),
+                        )
+                        .style(
+                            theme::tab_button(
+                                self.layout == Layout::Moov,
+                            ),
+                        )
+                        .padding([
+                            6,
+                            10,
+                        ]),
+
+                        button(
+                            text(
+                                "Carved layout",
+                            )
+                            .size(
+                                13,
+                            ),
+                        )
+                        .on_press(
+                            Message::SetLayout(
+                                Layout::Carved,
+                            ),
+                        )
+                        .style(
+                            theme::tab_button(
+                                self.layout == Layout::Carved,
+                            ),
+                        )
+                        .padding([
+                            6,
+                            10,
+                        ]),
+                    ]
+                    .spacing(
+                        6,
+                    ),
+                );
+        }
+
+        if let Some(carve) =
+            &self.carve
+        {
+            col =
+                col.push(
+                    text(
+                        carve_summary(
+                            &carve.analysis,
+                            carve.data.len() as u64,
+                        ),
+                    )
+                    .size(
+                        11,
+                    )
+                    .font(
+                        Font::MONOSPACE,
+                    )
+                    .color(
+                        theme::MUTED,
+                    ),
+                );
+        }
+
+        col.into()
+    }
+
     fn rail(
         &self,
     ) -> Element<'_, Message> {
@@ -1406,29 +2220,38 @@ impl State {
                     ),
                 );
 
+            if self.verified() {
+                col =
+                    col.push(
+                        self.carve_section(
+                            analysis,
+                        ),
+                    );
+            }
+
+            if let Some(details) =
+                self.details()
+            {
+                col =
+                    col.push(
+                        details,
+                    );
+            }
+
             col =
                 col.push(
-                    legend(),
+                    legend(
+                        self.layout,
+                    ),
                 );
 
             /*
-             * Extraction remains available only after
-             * evidence integrity has been verified.
+             * Extraction is available only after
+             * a carve has completed.
              */
-            if !analysis
-                .moov_present
-                && self
-                    .evidence
-                    .as_ref()
-                    .map(
-                        |e| {
-                            e.integrity_status
-                                == IntegrityStatus::Verified
-                        },
-                    )
-                    .unwrap_or(
-                        false,
-                    )
+            if self
+                .carve
+                .is_some()
             {
                 col =
                     col.push(
@@ -1465,7 +2288,9 @@ impl State {
 
             col =
                 col.push(
-                    legend(),
+                    legend(
+                        self.layout,
+                    ),
                 );
         }
 
@@ -1473,6 +2298,11 @@ impl State {
             col
                 .spacing(
                     10,
+                )
+                .padding(
+                    iced::padding::right(
+                        14,
+                    ),
                 )
                 .width(
                     Fill,
@@ -1744,49 +2574,21 @@ fn kv(
 }
 
 fn legend(
+    layout: Layout,
 ) -> Element<'static, Message> {
-    let items =
-        [
-            (
-                theme::MAP_FTYP,
-                "ftyp",
-            ),
+    let items: &[(
+        iced::Color,
+        &str,
+    )] =
+        match layout {
+            Layout::Moov => {
+                &theme::MOOV_LEGEND
+            }
 
-            (
-                theme::MAP_MOOV,
-                "moov",
-            ),
-
-            (
-                theme::MAP_I,
-                "I-frame",
-            ),
-
-            (
-                theme::MAP_P,
-                "P-frame",
-            ),
-
-            (
-                theme::MAP_B,
-                "B-frame",
-            ),
-
-            (
-                theme::MAP_AUDIO,
-                "audio",
-            ),
-
-            (
-                theme::MAP_FREE,
-                "free",
-            ),
-
-            (
-                theme::MAP_UNKNOWN,
-                "unmapped",
-            ),
-        ];
+            Layout::Carved => {
+                &theme::CARVE_LEGEND
+            }
+        };
 
     let mut col =
         column![
@@ -1804,7 +2606,7 @@ fn legend(
             6,
         );
 
-    for (
+    for &(
         color,
         label,
     ) in items
@@ -1851,9 +2653,6 @@ fn legend(
             );
     }
 
-    let _ =
-        SpanKind::Ftyp;
-
     col =
         col.push(
             text(
@@ -1868,6 +2667,153 @@ fn legend(
         );
 
     col.into()
+}
+
+fn carve_summary(
+    carve: &CarveAnalysis,
+    file_size: u64,
+) -> String {
+    let intra =
+        carve
+            .access_units
+            .iter()
+            .filter(|au| au.is_intra)
+            .count();
+
+    let tail =
+        match carve.truncation_offset {
+            Some(off) => {
+                format!(
+                    "chain broke at {off} ({:.2}% of file)",
+                    off as f64
+                        / file_size.max(1) as f64
+                        * 100.0,
+                )
+            }
+
+            None => {
+                String::from(
+                    "chain ran to end of mdat",
+                )
+            }
+        };
+
+    let source =
+        if carve.x264_options_found {
+            "x264 options found"
+        } else {
+            "parameters guessed"
+        };
+
+    format!(
+        "Carved {} NALs · {} access units ({} intra) · {} · {} skipped region(s) · {} · {} QP attempt(s)",
+        carve.nals.len(),
+        carve.access_units.len(),
+        intra,
+        tail,
+        carve.skipped.len(),
+        source,
+        carve.qp_attempts,
+    )
+}
+
+fn run_carve(
+    evidence: &EvidenceRecord,
+    parameters: &CarveParameters,
+    reporter: &mut ChannelReporter,
+) -> Result<
+    Arc<CarveResult>,
+    String,
+> {
+    use iframe_extract::report::Reporter;
+
+    reporter.phase(
+        "reading working copy",
+    );
+
+    let data =
+        std::fs::read(
+            &evidence.path,
+        )
+        .map_err(
+            |e| {
+                format!(
+                    "Reading working copy failed: {e}"
+                )
+            },
+        )?;
+
+    reporter.finish_phase(
+        &bitplay::human_bytes(
+            data.len() as u64,
+        ),
+    );
+
+    reporter.phase(
+        "verifying SHA-256",
+    );
+
+    let sha256 =
+        hex::encode(
+            Sha256::digest(
+                &data,
+            ),
+        );
+
+    if sha256
+        != evidence.sha256
+    {
+        return Err(
+            String::from(
+                "CRITICAL: working copy no longer matches the registered evidence SHA-256",
+            ),
+        );
+    }
+
+    reporter.finish_phase(
+        "matches evidence",
+    );
+
+    let analysis =
+        iframe_extract::extract::analyze(
+            &data,
+            &CarveOptions {
+                width:
+                    parameters.width,
+
+                height:
+                    parameters.height,
+
+                with_audio:
+                    parameters.with_audio,
+            },
+            reporter,
+        )
+        .map_err(
+            |e| {
+                format!(
+                    "Carve failed: {e}"
+                )
+            },
+        )?;
+
+    Ok(
+        Arc::new(
+            CarveResult {
+                data:
+                    Arc::new(
+                        data,
+                    ),
+
+                analysis,
+
+                path:
+                    evidence.path.clone(),
+
+                sha256,
+            },
+        ),
+    )
 }
 
 fn display_name(

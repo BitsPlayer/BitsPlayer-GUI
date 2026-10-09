@@ -461,6 +461,7 @@ dependencies = [
  "image 0.25.10",
  "libc",
  "rand_core 0.6.4",
+ "rayon",
  "rfd",
  "serde",
  "serde_json",
@@ -2174,6 +2175,7 @@ dependencies = [
  "image 0.25.10",
  "openh264",
  "openh264-sys2",
+ "rayon",
  "serde",
  "serde_json",
 ]
