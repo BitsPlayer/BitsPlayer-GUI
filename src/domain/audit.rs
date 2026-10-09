@@ -30,6 +30,7 @@ pub enum AuditAction {
     ExtractFailed,
     ArtifactCreated,
     CaseClosed,
+    CaseAbandoned,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -318,6 +318,7 @@ fn action_label(action: AuditAction) -> &'static str {
         AuditAction::ExtractFailed => "EXTRACT_FAILED",
         AuditAction::ArtifactCreated => "ARTIFACT_CREATED",
         AuditAction::CaseClosed => "CASE_CLOSED",
+        AuditAction::CaseAbandoned => "CASE_ABANDONED",
     }
 }
 

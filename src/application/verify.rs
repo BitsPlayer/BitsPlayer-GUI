@@ -130,6 +130,16 @@ pub fn verify_case_directories(
         .last()
         .ok_or_else(|| String::from("audit log contains no final entry"))?;
 
+    if let Some(abandoned) = entries
+        .iter()
+        .find(|entry| entry.action == AuditAction::CaseAbandoned)
+    {
+        return Err(format!(
+            "case was abandoned without sealing at sequence {}",
+            abandoned.sequence
+        ));
+    }
+
     if last_entry.action != AuditAction::CaseClosed {
         return Err(format!(
             "case is not sealed: final audit action is {:?}, expected CASE_CLOSED",
@@ -392,6 +402,7 @@ fn verify_operation_context(
             AuditAction::CaseCreated
             | AuditAction::CaseMetadataUpdated
             | AuditAction::CaseClosed
+            | AuditAction::CaseAbandoned
             | AuditAction::EvidenceCopyStarted
             | AuditAction::EvidenceCopyCompleted
             | AuditAction::EvidenceCopyFailed => {}

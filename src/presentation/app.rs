@@ -40,6 +40,9 @@ pub enum Message {
     CloseRequested(window::Id),
     CaseSealed(Result<SealedCase, String>),
     Exit,
+    CloseSeal,
+    CloseDiscard,
+    CloseCancel,
     Tab(Tab),
     Analyze(analyze::Message),
     Extract(extract::Message),
@@ -59,6 +62,7 @@ pub struct App {
     case_closed: bool,
     sealing: bool,
     seal_review: Option<SealedCase>,
+    close_prompt: bool,
     notice: Option<String>,
     active_extraction: Option<OperationContext>,
     active_carve: Option<OperationContext>,
@@ -67,6 +71,35 @@ pub struct App {
 impl App {
     fn audit_mut(&self) -> std::sync::MutexGuard<'_, Option<AuditLogger>> {
         self.audit.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn abandon_and_exit(&mut self) -> Task<Message> {
+        let case_id = self.case.id;
+        let logged = match self.audit_mut().as_mut() {
+            Some(logger) => logger
+                .log(
+                    case_id,
+                    AuditAction::CaseAbandoned,
+                    None,
+                    None,
+                    None,
+                    AuditResult::Success,
+                )
+                .map_err(|err| err.to_string()),
+            None => Err(String::from("audit logger is unavailable")),
+        };
+        match logged {
+            Ok(entry) => {
+                self.audit_entries.push(entry);
+                iced::exit()
+            }
+            Err(err) => {
+                self.notice = Some(format!(
+                    "Could not record CASE_ABANDONED, the case is still open: {err}"
+                ));
+                Task::none()
+            }
+        }
     }
 
     fn spawn_seal(&self) -> Task<Message> {
@@ -104,6 +137,7 @@ impl App {
     pub fn boot() -> (Self, Task<Message>) {
         let (main_window, open) = window::open(window::Settings {
             size: Size::new(1280.0, 820.0),
+            exit_on_close_request: false,
             ..Default::default()
         });
 
@@ -170,6 +204,7 @@ impl App {
                 case_closed: false,
                 sealing: false,
                 seal_review: None,
+                close_prompt: false,
                 notice: None,
                 active_extraction: None,
                 active_carve: None,
@@ -214,6 +249,24 @@ impl App {
         match message {
             Message::MainOpened | Message::HexOpened => Task::none(),
             Message::Exit => iced::exit(),
+            Message::CloseSeal => {
+                self.close_prompt = false;
+                if self.sealing || self.case_closed {
+                    return Task::none();
+                }
+                self.sealing = true;
+                self.notice = Some(String::from("Sealing forensic case…"));
+                self.analyze.status = String::from("Sealing forensic case…");
+                self.spawn_seal()
+            }
+            Message::CloseDiscard => {
+                self.close_prompt = false;
+                self.abandon_and_exit()
+            }
+            Message::CloseCancel => {
+                self.close_prompt = false;
+                Task::none()
+            }
             Message::CloseRequested(id) => {
                 if id == self.main_window {
                     if self.case_closed {
@@ -222,10 +275,15 @@ impl App {
                     if self.sealing {
                         return Task::none();
                     }
-                    self.sealing = true;
-                    self.notice = Some(String::from("Sealing forensic case…"));
-                    self.analyze.status = String::from("Sealing forensic case…");
-                    self.spawn_seal()
+                    let untouched = self
+                        .audit_entries
+                        .iter()
+                        .all(|entry| entry.action == AuditAction::CaseCreated);
+                    if untouched {
+                        return self.abandon_and_exit();
+                    }
+                    self.close_prompt = true;
+                    Task::none()
                 } else if Some(id) == self.hex_window {
                     self.hex_window = None;
                     let _ = self.analyze.update(analyze::Message::CloseHex);
@@ -1081,8 +1139,63 @@ impl App {
             );
         }
 
-        column.push(body).height(Fill).into()
+        let main: Element<_> = column.push(body).height(Fill).into();
+        if self.close_prompt {
+            iced::widget::stack![main, close_dialog()].into()
+        } else {
+            main
+        }
     }
+}
+
+fn close_dialog() -> Element<'static, Message> {
+    use iced::widget::{button, center, column, container, mouse_area, opaque, row, text, Space};
+
+    let dialog = container(
+        column![
+            text("Close this case?").size(18).color(theme::TEXT),
+            text(
+                "Seal writes the report, closes the audit log with CASE_CLOSED and signs it. \
+                 Discard records CASE_ABANDONED and exits; the case stays on disk unsealed \
+                 and will not verify.",
+            )
+            .size(13)
+            .color(theme::MUTED),
+            row![
+                Space::with_width(Fill),
+                button(text("Cancel").size(14))
+                    .on_press(Message::CloseCancel)
+                    .style(theme::secondary_button)
+                    .padding([8, 14]),
+                button(text("Discard").size(14))
+                    .on_press(Message::CloseDiscard)
+                    .style(theme::secondary_button)
+                    .padding([8, 14]),
+                button(text("Seal case").size(14))
+                    .on_press(Message::CloseSeal)
+                    .style(theme::primary_button)
+                    .padding([8, 14]),
+            ]
+            .spacing(8),
+        ]
+        .spacing(14),
+    )
+    .padding(20)
+    .max_width(460)
+    .style(theme::panel);
+
+    opaque(
+        mouse_area(
+            center(opaque(dialog)).style(|_| container::Style {
+                background: Some(iced::Background::Color(iced::Color {
+                    a: 0.6,
+                    ..iced::Color::BLACK
+                })),
+                ..Default::default()
+            }),
+        )
+        .on_press(Message::CloseCancel),
+    )
 }
 
 fn carve_context(path: &Path, parameters: CarveParameters) -> OperationContext {

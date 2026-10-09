@@ -18,7 +18,7 @@ The source file is only read. Before analysis it is copied into the case as a re
 
 4. **Custody.** Open this tab at any point before you close the window. It shows the case id, examiner, directory, host, and build, then one row for every audit entry committed so far. Opening the tab does not add an entry.
 
-5. **Close the window.** The app writes `report.json`, `report.html`, and `report_manifest.json`, appends `CASE_CLOSED`, writes `case_closure.json` and `case_signature.json`, and runs the same checks as `bitsplayer-verify`. The checklist stays on screen. **Exit**, or close the window again, leaves the application. If sealing fails, the window stays open and the error is shown.
+5. **Close the window.** The app asks whether to seal or discard the case. **Discard** appends `CASE_ABANDONED` and exits, leaving the case unsealed. A case with nothing past `CASE_CREATED` is discarded without asking. **Seal case** writes `report.json`, `report.html`, and `report_manifest.json`, appends `CASE_CLOSED`, writes `case_closure.json` and `case_signature.json`, and runs the same checks as `bitsplayer-verify`. The checklist stays on screen. **Exit**, or close the window again, leaves the application. If sealing fails, the window stays open and the error is shown.
 
 The first seal on a machine creates an Ed25519 key under `~/.config/bitsplayer/signing/`. The review says so. Later seals reuse that key. The signature is meaningful once you trust `public.key` from that directory.
 
@@ -101,6 +101,7 @@ Actions you will see:
 | `EXTRACT_STARTED` / `EXTRACT_COMPLETED` / `EXTRACT_FAILED` | Around frame recovery. These rows include width, height, matrix, and the include flags, plus `frame_offset` for single-frame extraction. Once a case has carve rows, each extract must follow a completed carve with the same width and height. |
 | `ARTIFACT_CREATED` | A PNG was written and hashed. The row links it to the source evidence hash. |
 | `CASE_CLOSED` | The seal succeeded. This is the last row. |
+| `CASE_ABANDONED` | The examiner discarded the case on close. It is the last row, and the case does not verify. |
 
 `case_closure.json` stores that last sequence number and head hash. `report_manifest.json` holds the SHA-256 of `report.json` and `report.html`, and its own hash is stored in the closure. `case_signature.json` is an Ed25519 signature over the case id, that head, the `case.json` hash, and the report manifest hash. Verification loads your trusted public key and requires the key embedded in the signature file to be the same key. A key carried inside the case is not treated as the trust anchor.
 
