@@ -560,7 +560,7 @@ impl App {
             };
 
             let Some(path) = self.extract.path.clone() else {
-                self.extract.error = Some(String::from("Choose an MP4 file first"));
+                self.extract.error = Some(String::from("Choose an MP4 or MOV file first"));
                 return Task::none();
             };
 
@@ -1066,7 +1066,7 @@ impl App {
             iced::widget::row![
                 iced::widget::column![
                     iced::widget::text("BitsPlayer").size(20).color(theme::TEXT),
-                    iced::widget::text("MP4 forensics")
+                    iced::widget::text("MP4/MOV forensics")
                         .size(12)
                         .color(theme::MUTED),
                 ]

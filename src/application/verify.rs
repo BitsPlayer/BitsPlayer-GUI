@@ -1648,6 +1648,7 @@ mod tests {
             width,
             height,
             with_audio: false,
+            codec: None,
         });
         context
     }

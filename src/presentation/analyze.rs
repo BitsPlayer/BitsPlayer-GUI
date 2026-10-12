@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bitplay::Analysis;
+use iframe_extract::codec::Codec;
 use iframe_extract::extract::{CarveAnalysis, CarveOptions};
 use sha2::{Digest, Sha256};
 
@@ -12,6 +13,7 @@ use iced::widget::{
     checkbox,
     column,
     container,
+    pick_list,
     progress_bar,
     row,
     scrollable,
@@ -39,6 +41,36 @@ use crate::presentation::widgets::file_map::{
 };
 
 use crate::presentation::widgets::hex_view;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodecChoice {
+    #[default]
+    Auto,
+    H264,
+    H265,
+}
+
+impl CodecChoice {
+    const ALL: [CodecChoice; 3] = [CodecChoice::Auto, CodecChoice::H264, CodecChoice::H265];
+
+    fn to_codec(self) -> Option<Codec> {
+        match self {
+            Self::Auto => None,
+            Self::H264 => Some(Codec::H264),
+            Self::H265 => Some(Codec::H265),
+        }
+    }
+}
+
+impl std::fmt::Display for CodecChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "Auto codec",
+            Self::H264 => "H.264",
+            Self::H265 => "H.265",
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -111,6 +143,10 @@ pub enum Message {
 
     CarveAudio(
         bool,
+    ),
+
+    CarveCodec(
+        CodecChoice,
     ),
 
     Carve,
@@ -197,6 +233,8 @@ pub struct State {
 
     pub with_audio: bool,
 
+    pub codec: CodecChoice,
+
     pub carving: bool,
 
     pub carve: Option<Arc<CarveResult>>,
@@ -235,6 +273,8 @@ impl Default for State {
 
             with_audio: false,
 
+            codec: CodecChoice::Auto,
+
             carving: false,
 
             carve: None,
@@ -243,7 +283,7 @@ impl Default for State {
 
             status:
                 String::from(
-                    "Open an MP4 to map its layout",
+                    "Open an MP4 or MOV to map its layout",
                 ),
 
             hex:
@@ -273,7 +313,7 @@ impl State {
                 let picked =
                     rfd::FileDialog::new()
                         .add_filter(
-                            "MP4 video",
+                            "MP4/MOV video",
                             &[
                                 "mp4",
                                 "m4v",
@@ -871,6 +911,17 @@ impl State {
                 Task::none()
             }
 
+            Message::CarveCodec(
+                v,
+            ) => {
+                if !self.carving {
+                    self.codec =
+                        v;
+                }
+
+                Task::none()
+            }
+
             Message::Carve => {
                 self.start_carve()
             }
@@ -1044,6 +1095,10 @@ impl State {
                 height,
                 with_audio:
                     self.with_audio,
+                codec:
+                    self.codec
+                        .to_codec()
+                        .map(|c| c.label().to_string()),
             },
         )
     }
@@ -1859,7 +1914,7 @@ impl State {
                 ),
 
                 checkbox(
-                    "With audio",
+                    "File has audio",
                     self.with_audio,
                 )
                 .on_toggle_maybe(
@@ -1872,6 +1927,18 @@ impl State {
                 )
                 .text_size(
                     13,
+                ),
+
+                pick_list(
+                    CodecChoice::ALL,
+                    Some(self.codec),
+                    Message::CarveCodec,
+                )
+                .text_size(
+                    13,
+                )
+                .padding(
+                    8,
                 ),
 
                 button(
@@ -2051,7 +2118,7 @@ impl State {
                         if self.busy {
                             "Analyzing…"
                         } else {
-                            "Open MP4"
+                            "Open video"
                         }
                     )
                     .size(
@@ -2335,7 +2402,7 @@ impl State {
             ),
 
             text(
-                "Open an MP4 to see how video, audio, and GOPs are laid out."
+                "Open an MP4 or MOV to see how video, audio, and GOPs are laid out."
             )
             .size(
                 13
@@ -2360,7 +2427,7 @@ impl State {
 
             button(
                 text(
-                    "Open MP4"
+                    "Open video"
                 )
                 .size(
                     14
@@ -2698,15 +2765,31 @@ fn carve_summary(
             }
         };
 
+    let hevc_label =
+        carve
+            .hevc
+            .as_ref()
+            .and_then(|h| h.label.as_deref());
+
     let source =
         if carve.x264_options_found {
-            "x264 options found"
+            String::from("x264 options found")
+        } else if carve
+            .hevc
+            .as_ref()
+            .is_some_and(|h| h.x265_options_found)
+        {
+            String::from("x265 options found")
+        } else if let Some(label) = hevc_label {
+            format!("parameters from {label}")
         } else {
-            "parameters guessed"
+            String::from("parameters guessed")
         };
 
     format!(
-        "Carved {} NALs · {} access units ({} intra) · {} · {} skipped region(s) · {} · {} QP attempt(s)",
+        "{} in {} · carved {} NALs · {} access units ({} intra) · {} · {} skipped region(s) · {} · {} QP attempt(s)",
+        carve.codec.label(),
+        carve.container.kind.to_uppercase(),
         carve.nals.len(),
         carve.access_units.len(),
         intra,
@@ -2786,6 +2869,13 @@ fn run_carve(
 
                 with_audio:
                     parameters.with_audio,
+
+                codec:
+                    match parameters.codec.as_deref() {
+                        Some("H.264") => Some(Codec::H264),
+                        Some("H.265") => Some(Codec::H265),
+                        _ => None,
+                    },
             },
             reporter,
         )

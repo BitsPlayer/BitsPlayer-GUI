@@ -230,7 +230,7 @@ impl State {
         }
         if self.source_evidence_sha256.is_none() {
             return Err(String::from(
-                "Evidence is not verified. Analyze and verify the MP4 before forensic extraction.",
+                "Evidence is not verified. Analyze and verify the MP4/MOV before forensic extraction.",
             ));
         }
         Ok(())
@@ -643,7 +643,7 @@ let status = container(
         };
 
         let flags = row![
-            checkbox("Include non-IDR", self.include_non_idr)
+            checkbox("Include all I-frames", self.include_non_idr)
                 .on_toggle_maybe((!self.running).then_some(Message::ToggleNonIdr))
                 .size(16)
                 .text_size(13),
@@ -848,13 +848,15 @@ fn run_decode(
     };
     let summary = match r.truncation_offset {
         Some(off) => format!(
-            "{} NALs · {} frames · chain broke at {off} ({:.2}% of file){skipped}",
+            "{} · {} NALs · {} frames · chain broke at {off} ({:.2}% of file){skipped}",
+            r.codec.label(),
             r.nal_count,
             frames.len(),
             off as f64 / carve.data.len().max(1) as f64 * 100.0
         ),
         None => format!(
-            "{} NALs · {} frames · chain ran to end of mdat{skipped}",
+            "{} · {} NALs · {} frames · chain ran to end of mdat{skipped}",
+            r.codec.label(),
             r.nal_count,
             frames.len()
         ),

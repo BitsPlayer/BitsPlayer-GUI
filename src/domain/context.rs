@@ -31,6 +31,8 @@ pub struct CarveParameters {
     pub width: u32,
     pub height: u32,
     pub with_audio: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
