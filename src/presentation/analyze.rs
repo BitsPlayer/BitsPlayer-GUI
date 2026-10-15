@@ -72,6 +72,46 @@ impl std::fmt::Display for CodecChoice {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionChoice {
+    Preset(u32, u32),
+    Custom,
+}
+
+impl ResolutionChoice {
+    const ALL: [ResolutionChoice; 13] = [
+        Self::Preset(1920, 1080),
+        Self::Preset(1280, 720),
+        Self::Preset(3840, 2160),
+        Self::Preset(2560, 1440),
+        Self::Preset(1440, 1080),
+        Self::Preset(854, 480),
+        Self::Preset(720, 576),
+        Self::Preset(720, 480),
+        Self::Preset(640, 480),
+        Self::Preset(1080, 1920),
+        Self::Preset(720, 1280),
+        Self::Preset(2160, 3840),
+        Self::Custom,
+    ];
+
+    fn matching(width: u32, height: u32) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|c| *c == Self::Preset(width, height))
+            .unwrap_or(Self::Custom)
+    }
+}
+
+impl std::fmt::Display for ResolutionChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Preset(w, h) => write!(f, "{w} × {h}"),
+            Self::Custom => f.write_str("Custom…"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Browse,
@@ -132,6 +172,10 @@ pub enum Message {
     CloseHex,
 
     OpenExtract,
+
+    CarveResolution(
+        ResolutionChoice,
+    ),
 
     CarveWidth(
         String,
@@ -227,6 +271,8 @@ pub struct State {
 
     pub layout: Layout,
 
+    pub resolution: Option<ResolutionChoice>,
+
     pub width: String,
 
     pub height: String,
@@ -266,6 +312,8 @@ impl Default for State {
             carve_map: None,
 
             layout: Layout::Moov,
+
+            resolution: None,
 
             width: String::new(),
 
@@ -359,6 +407,9 @@ impl State {
 
                 self.layout =
                     Layout::Moov;
+
+                self.resolution =
+                    None;
 
                 self.width.clear();
 
@@ -711,6 +762,18 @@ impl State {
                                 self.height =
                                     v.height.to_string();
                             }
+
+                            if v.width > 0
+                                && v.height > 0
+                            {
+                                self.resolution =
+                                    Some(
+                                        ResolutionChoice::matching(
+                                            v.width,
+                                            v.height,
+                                        ),
+                                    );
+                            }
                         }
 
                         self.status =
@@ -875,6 +938,27 @@ impl State {
             Message::ExtractSelected(
                 _,
             ) => {
+                Task::none()
+            }
+
+            Message::CarveResolution(
+                v,
+            ) => {
+                if !self.carving {
+                    if let ResolutionChoice::Preset(w, h) = v {
+                        self.width =
+                            w.to_string();
+
+                        self.height =
+                            h.to_string();
+                    }
+
+                    self.resolution =
+                        Some(
+                            v,
+                        );
+                }
+
                 Task::none()
             }
 
@@ -1857,62 +1941,88 @@ impl State {
                     theme::MUTED,
                 ),
 
-                row![
-                    text_input(
-                        "width",
-                        &self.width,
-                    )
-                    .on_input_maybe(
-                        idle.then_some(
-                            Message::CarveWidth,
-                        ),
-                    )
-                    .style(
-                        theme::field,
-                    )
-                    .width(
-                        88,
-                    )
-                    .padding(
-                        8,
-                    ),
-
-                    text(
-                        "×",
-                    )
-                    .size(
-                        16,
-                    )
-                    .color(
-                        theme::MUTED,
-                    ),
-
-                    text_input(
-                        "height",
-                        &self.height,
-                    )
-                    .on_input_maybe(
-                        idle.then_some(
-                            Message::CarveHeight,
-                        ),
-                    )
-                    .style(
-                        theme::field,
-                    )
-                    .width(
-                        88,
-                    )
-                    .padding(
-                        8,
-                    ),
-                ]
-                .spacing(
-                    8,
+                pick_list(
+                    ResolutionChoice::ALL,
+                    self.resolution,
+                    Message::CarveResolution,
                 )
-                .align_y(
-                    iced::Alignment::Center,
+                .placeholder(
+                    "Resolution",
+                )
+                .text_size(
+                    13,
+                )
+                .padding(
+                    8,
                 ),
+            ]
+            .spacing(
+                6,
+            );
 
+        if self.resolution == Some(ResolutionChoice::Custom) {
+            col =
+                col.push(
+                    row![
+                        text_input(
+                            "width",
+                            &self.width,
+                        )
+                        .on_input_maybe(
+                            idle.then_some(
+                                Message::CarveWidth,
+                            ),
+                        )
+                        .style(
+                            theme::field,
+                        )
+                        .width(
+                            88,
+                        )
+                        .padding(
+                            8,
+                        ),
+
+                        text(
+                            "×",
+                        )
+                        .size(
+                            16,
+                        )
+                        .color(
+                            theme::MUTED,
+                        ),
+
+                        text_input(
+                            "height",
+                            &self.height,
+                        )
+                        .on_input_maybe(
+                            idle.then_some(
+                                Message::CarveHeight,
+                            ),
+                        )
+                        .style(
+                            theme::field,
+                        )
+                        .width(
+                            88,
+                        )
+                        .padding(
+                            8,
+                        ),
+                    ]
+                    .spacing(
+                        8,
+                    )
+                    .align_y(
+                        iced::Alignment::Center,
+                    ),
+                );
+        }
+
+        col =
+            col.extend([
                 checkbox(
                     "File has audio",
                     self.with_audio,
@@ -1927,7 +2037,8 @@ impl State {
                 )
                 .text_size(
                     13,
-                ),
+                )
+                .into(),
 
                 pick_list(
                     CodecChoice::ALL,
@@ -1939,7 +2050,8 @@ impl State {
                 )
                 .padding(
                     8,
-                ),
+                )
+                .into(),
 
                 button(
                     text(
@@ -1971,11 +2083,9 @@ impl State {
                 .padding([
                     10,
                     14,
-                ]),
-            ]
-            .spacing(
-                6,
-            );
+                ])
+                .into(),
+            ]);
 
         if self.carving {
             let pct =
