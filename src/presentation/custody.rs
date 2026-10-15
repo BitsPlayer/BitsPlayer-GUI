@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 
 use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Element, Fill, Font};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::forensic::audit::{AuditAction, AuditEntry, AuditResult};
@@ -96,6 +97,9 @@ pub fn view<'a, Message: 'a>(snapshot: Snapshot<'a>) -> Element<'a, Message> {
 pub fn seal_review<'a, Message: Clone + 'a>(
     review: Review<'a>,
     exit: Message,
+    export: Message,
+    export_busy: bool,
+    export_status: Option<&'a Result<PathBuf, String>>,
 ) -> Element<'a, Message> {
     let mut body = column![section_title("Seal review")].spacing(6).width(Fill);
 
@@ -167,11 +171,26 @@ pub fn seal_review<'a, Message: Clone + 'a>(
         "The case is already sealed on disk. Close the window again to exit.",
     ));
     body = body.push(
-        button(text("Exit").size(14))
-            .on_press(exit)
-            .style(theme::primary_button)
-            .padding([10, 16]),
+        row![
+            button(text("Exit").size(14))
+                .on_press(exit)
+                .style(theme::primary_button)
+                .padding([10, 16]),
+            button(text("Export signed PDF").size(14))
+                .on_press_maybe((!export_busy).then_some(export))
+                .style(theme::secondary_button)
+                .padding([10, 16]),
+        ]
+        .spacing(8),
     );
+    if export_busy {
+        body = body.push(muted("Exporting signed PDF…"));
+    } else if let Some(result) = export_status {
+        body = body.push(match result {
+            Ok(path) => muted(format!("Signed PDF written to {}", path.display())),
+            Err(error) => text(error).size(13).color(theme::DANGER).into(),
+        });
+    }
 
     scrollable(container(body).padding(16).width(Fill))
         .width(Fill)

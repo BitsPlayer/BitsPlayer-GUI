@@ -14,6 +14,7 @@ use crate::forensic::audit::{AuditAction, AuditEntry, AuditLogger, AuditResult};
 use crate::forensic::case::Case;
 use crate::forensic::context::{CarveParameters, HostContext, OperationContext};
 use crate::forensic::evidence::IntegrityStatus;
+use crate::forensic::report::export_signed_pdf;
 use crate::forensic::seal::SealReport;
 use crate::forensic::verify::VerificationReport;
 use crate::presentation::theme;
@@ -31,6 +32,8 @@ pub struct SealedCase {
     report: SealReport,
     entries: Result<Vec<AuditEntry>, String>,
     verification: Result<VerificationReport, String>,
+    exporting: bool,
+    export_status: Option<Result<PathBuf, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +42,8 @@ pub enum Message {
     HexOpened,
     CloseRequested(window::Id),
     CaseSealed(Result<SealedCase, String>),
+    ExportPdf,
+    PdfExported(Result<PathBuf, String>),
     Exit,
     CloseSeal,
     CloseDiscard,
@@ -249,6 +254,51 @@ impl App {
         match message {
             Message::MainOpened | Message::HexOpened => Task::none(),
             Message::Exit => iced::exit(),
+            Message::ExportPdf => {
+                let Some(sealed) = self.seal_review.as_mut() else {
+                    return Task::none();
+                };
+                if sealed.exporting {
+                    return Task::none();
+                }
+                let file_name = format!(
+                    "{}_report.pdf",
+                    self.case.name.replace(['/', '\\'], "_")
+                );
+                let Some(path) = rfd::FileDialog::new()
+                    .add_filter("PDF", &["pdf"])
+                    .set_file_name(&file_name)
+                    .save_file()
+                else {
+                    return Task::none();
+                };
+                sealed.exporting = true;
+                sealed.export_status = None;
+                let report = sealed.report.clone();
+                let case = self.case.clone();
+                Task::perform(
+                    async move {
+                        match tokio::task::spawn_blocking(move || {
+                            export_signed_pdf(&case, &report, &path)
+                                .map(|()| path)
+                                .map_err(|err| format!("PDF export failed: {err}"))
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(err) => Err(format!("PDF export task failed: {err}")),
+                        }
+                    },
+                    Message::PdfExported,
+                )
+            }
+            Message::PdfExported(result) => {
+                if let Some(sealed) = self.seal_review.as_mut() {
+                    sealed.exporting = false;
+                    sealed.export_status = Some(result);
+                }
+                Task::none()
+            }
             Message::CloseSeal => {
                 self.close_prompt = false;
                 if self.sealing || self.case_closed {
@@ -1110,6 +1160,9 @@ impl App {
                     verification: &sealed.verification,
                 },
                 Message::Exit,
+                Message::ExportPdf,
+                sealed.exporting,
+                sealed.export_status.as_ref(),
             )
         } else {
             match self.tab {
@@ -1251,5 +1304,7 @@ fn seal_and_verify(
         report,
         entries,
         verification,
+        exporting: false,
+        export_status: None,
     })
 }

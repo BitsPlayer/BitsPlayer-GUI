@@ -10,6 +10,8 @@ pub mod evidence;
 pub mod evidence_copy;
 pub mod export;
 pub mod hashing;
+pub mod pdf_report;
+pub mod pdf_signing;
 pub mod provenance;
 pub mod report;
 pub mod signing;

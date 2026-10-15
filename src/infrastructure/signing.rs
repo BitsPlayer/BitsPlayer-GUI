@@ -169,7 +169,7 @@ fn read_signing_key(path: &Path) -> io::Result<SigningKey> {
     Ok(SigningKey::from_bytes(&key_bytes))
 }
 
-fn signing_directory() -> io::Result<PathBuf> {
+pub(crate) fn signing_directory() -> io::Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -183,7 +183,7 @@ fn signing_directory() -> io::Result<PathBuf> {
         .join("signing"))
 }
 
-fn ensure_private_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
     if path.exists() {
         #[cfg(unix)]
         {
@@ -211,7 +211,7 @@ fn ensure_private_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn write_private_file(path: &Path, contents: &str) -> io::Result<()> {
+pub(crate) fn write_private_file(path: &Path, contents: &str) -> io::Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -226,7 +226,7 @@ fn write_private_file(path: &Path, contents: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn write_public_file(path: &Path, contents: &str) -> io::Result<()> {
+pub(crate) fn write_public_file(path: &Path, contents: &str) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -237,7 +237,7 @@ fn write_public_file(path: &Path, contents: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn restrict_private_key(path: &Path) -> io::Result<()> {
+pub(crate) fn restrict_private_key(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
