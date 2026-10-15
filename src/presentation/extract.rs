@@ -18,6 +18,7 @@ use crate::presentation::analyze::CarveResult;
 use crate::presentation::progress::ChannelReporter;
 use crate::presentation::theme;
 use crate::presentation::widgets::frame_grid::{self, Thumb};
+use crate::presentation::widgets::file_map::AuClass;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MatrixChoice {
@@ -72,6 +73,7 @@ pub enum SaveOutcome {
 
 struct DecodedFrame {
     record: FrameRecord,
+    class: AuClass,
     frame: Frame,
 }
 
@@ -731,6 +733,7 @@ let status = container(
                         offset: f.record.offset,
                         source_size: f.record.source_size,
                         partial: f.record.partial,
+                        class: f.class,
                         handle: self.thumbs.get(&p).cloned(),
                     }
                 })
@@ -835,7 +838,19 @@ fn run_decode(
     let frames: Vec<DecodedFrame> = extraction
         .frames
         .into_iter()
-        .map(|(record, frame)| DecodedFrame { record, frame })
+        .map(|(record, frame)| {
+            let class = match carve
+                .analysis
+                .access_units
+                .iter()
+                .find(|au| au.offset == record.offset)
+            {
+                Some(au) if au.is_idr => AuClass::Idr,
+                Some(au) if au.is_intra => AuClass::Intra,
+                _ => AuClass::Inter,
+            };
+            DecodedFrame { record, class, frame }
+        })
         .collect();
 
     let r = &extraction.report;

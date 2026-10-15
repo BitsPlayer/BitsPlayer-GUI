@@ -4,6 +4,7 @@ use iced::{ContentFit, Element, Length};
 use iframe_extract::report::human_bytes;
 
 use crate::presentation::theme;
+use crate::presentation::widgets::file_map::AuClass;
 
 pub const CARD_W: f32 = 176.0;
 pub const CARD_H: f32 = 150.0;
@@ -17,6 +18,7 @@ pub struct Thumb {
     pub offset: u64,
     pub source_size: u64,
     pub partial: bool,
+    pub class: AuClass,
     pub handle: Option<Handle>,
 }
 
@@ -62,8 +64,13 @@ fn thumb_card(
     selected: bool,
     on_select: impl Fn(usize) -> crate::presentation::extract::Message + Copy + 'static,
 ) -> Element<'static, crate::presentation::extract::Message> {
+    let (tag, color) = match thumb.class {
+        AuClass::Idr => ("IDR", theme::MAP_I),
+        AuClass::Intra => ("I", theme::MAP_I_NON_IDR),
+        AuClass::Inter => ("P", theme::MAP_P),
+    };
     let label = format!(
-        "I {:>5}  off {:>10}{}",
+        "{:>5}  off {:>10}{}",
         thumb.index,
         thumb.offset,
         if thumb.partial { "  partial" } else { "" }
@@ -80,16 +87,33 @@ fn thumb_card(
         container(picture)
             .width(Length::Fill)
             .height(112)
-            .style(if selected {
-                theme::elevated
-            } else {
-                theme::map_well
+            .style(move |t| {
+                let base = if selected {
+                    theme::elevated(t)
+                } else {
+                    theme::map_well(t)
+                };
+                container::Style {
+                    border: iced::Border {
+                        color,
+                        width: 1.5,
+                        ..base.border
+                    },
+                    ..base
+                }
             }),
         column![
-            text(label)
-                .size(11)
-                .font(iced::Font::MONOSPACE)
-                .color(theme::MUTED),
+            row![
+                text(tag)
+                    .size(11)
+                    .font(iced::Font::MONOSPACE)
+                    .color(color),
+                text(label)
+                    .size(11)
+                    .font(iced::Font::MONOSPACE)
+                    .color(theme::MUTED),
+            ]
+            .spacing(4),
             text(sizes)
                 .size(11)
                 .font(iced::Font::MONOSPACE)
